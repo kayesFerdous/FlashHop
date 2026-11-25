@@ -1,0 +1,12 @@
+[package]
+name = "akhri_android"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "akhri"
+crate-type = ["cdylib"]
+
+[dependencies]
+akhri_core = { path = "../../core" }
+jni = "0.21"

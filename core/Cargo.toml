@@ -1,0 +1,7 @@
+[package]
+name = "akhri_core"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies: protocol + engine on std only. Shared by desktop and Android.
+[dependencies]

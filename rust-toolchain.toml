@@ -1,0 +1,5 @@
+# Same compiler for desktop, Android (android/setup-tools.sh) and CI. Keep the two versions equal.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy"]

@@ -1,0 +1,16 @@
+[package]
+name = "akhri_pasta"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+akhri_core = { path = "../core" }
+# glow (OpenGL) instead of wgpu: much smaller binary. Linux is forced onto X11/XWayland
+# in main.rs because winit has no Wayland drag-and-drop.
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "x11", "default_fonts", "clipboard", "accesskit"] }
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] } # file lists, images
+png = "0.18"                                              # clipboard image -> .png
+
+# Already pulled in by eframe; listed only to force the X11 backend (see main.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["x11"] }

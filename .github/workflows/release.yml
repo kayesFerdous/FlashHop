@@ -1,0 +1,117 @@
+# Every push/PR: lint, test, and build all three apps (downloadable as workflow artifacts).
+# Push a tag like v0.2.0: same, then publish a GitHub Release with the files attached.
+# Asset names have no version so README links to releases/latest/download/<name> never break.
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with: { distribution: temurin, java-version: 21 }
+      - run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.1.0" > /dev/null
+      - run: android/setup-tools.sh
+      # Optional stable release key. Without these secrets each build is signed with a throwaway
+      # debug key, and phones must uninstall the old version before installing a new one.
+      - name: Signing key
+        env: { KEYSTORE_B64: "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" }
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "AKHRI_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          fi
+      - run: android/build.sh
+        env:
+          AKHRI_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          AKHRI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      - run: mv android/akhri_pasta.apk akhri_pasta-android.apk
+      - uses: actions/upload-artifact@v7
+        with: { name: android, path: akhri_pasta-android.apk }
+
+  linux:
+    runs-on: ubuntu-22.04 # older glibc = runs on more distros
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release -p akhri_pasta
+      - run: tar -C target/release -czf akhri_pasta-linux-x86_64.tar.gz akhri_pasta
+      - uses: actions/upload-artifact@v7
+        with: { name: linux, path: akhri_pasta-linux-x86_64.tar.gz }
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: |
+          cargo build --release -p akhri_pasta --target aarch64-apple-darwin
+          cargo build --release -p akhri_pasta --target x86_64-apple-darwin
+      - name: Universal .app bundle
+        run: |
+          VERSION=$(grep -m1 '^version' desktop/Cargo.toml | cut -d'"' -f2)
+          APP="Akhri Pasta.app"
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create -output "$APP/Contents/MacOS/akhri_pasta" \
+            target/aarch64-apple-darwin/release/akhri_pasta target/x86_64-apple-darwin/release/akhri_pasta
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Akhri Pasta</string>
+            <key>CFBundleIdentifier</key><string>app.akhripasta</string>
+            <key>CFBundleExecutable</key><string>akhri_pasta</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>Finds your other devices and sends files to them over this network.</string>
+          </dict></plist>
+          EOF
+          codesign --force --deep -s - "$APP"   # ad-hoc: no Apple developer account needed
+          ditto -c -k --keepParent "$APP" akhri_pasta-macos.zip
+      - uses: actions/upload-artifact@v7
+        with: { name: macos, path: akhri_pasta-macos.zip }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, android, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { path: dist, merge-multiple: true }
+      - name: Publish release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          cat > notes.md <<'EOF'
+          ## Download
+
+          | Device | File | First run |
+          |---|---|---|
+          | Android 11+ | `akhri_pasta-android.apk` | Open it on the phone and allow "install unknown apps" when asked. |
+          | macOS 11+ (Intel and Apple Silicon) | `akhri_pasta-macos.zip` | Unzip and move to Applications. On first open, macOS blocks it because it is unsigned: go to System Settings → Privacy & Security → **Open Anyway**. |
+          | Linux x86_64 | `akhri_pasta-linux-x86_64.tar.gz` | `tar xzf akhri_pasta-linux-x86_64.tar.gz && ./akhri_pasta` |
+
+          All devices must be on the same Wi-Fi/router. Port 47821 (UDP + TCP) must not be blocked by a firewall.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "Akhri Pasta $GITHUB_REF_NAME" --notes-file notes.md --generate-notes
