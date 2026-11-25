@@ -21,7 +21,11 @@ object Core {
 
 class Peer(val id: Long, val name: String, val ip: String)
 class Offer(val id: Long, val summary: String)
-class Job(val id: Long, val label: String, val active: Boolean, val failed: Boolean, val fraction: Float, val status: String)
+/** [state] is `w` waiting, `r` running, `d` done, `f` failed. */
+class Job(val id: Long, val label: String, val state: Char, val incoming: Boolean, val fraction: Float, val status: String) {
+    val active get() = state == 'w' || state == 'r'
+    val failed get() = state == 'f'
+}
 
 /** Parsed `Core.snapshot()` (format documented in android/rust/src/lib.rs). */
 class Snap(records: Array<String>) {
@@ -36,7 +40,7 @@ class Snap(records: Array<String>) {
             when (f[0]) {
                 "P" -> peers += Peer(f[1].toLong(), f[2], f[3])
                 "O" -> offers += Offer(f[1].toLong(), f[2])
-                "J" -> jobs += Job(f[1].toLong(), f[2], f[3] == "1", f[4] == "1", f[5].toFloat(), f[6])
+                "J" -> jobs += Job(f[1].toLong(), f[2], f[3][0], f[4] == "1", f[5].toFloat(), f[6])
                 "T" -> texts += r.substring(2)
             }
         }

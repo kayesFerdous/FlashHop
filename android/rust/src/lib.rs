@@ -81,7 +81,8 @@ pub extern "system" fn Java_app_akhripasta_Core_waitChange(_: JNIEnv, _: JObject
 }
 
 /// One record per string, fields separated by U+001F:
-/// `P id name ip` | `O id summary` | `J id label active failed fraction status` | `T text`
+/// `P id name ip` | `O id summary` | `J id label state incoming fraction status` | `T text`
+/// where state is one of `w` (waiting), `r` (running), `d` (done), `f` (failed).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_app_akhripasta_Core_snapshot(mut env: JNIEnv, _: JObject) -> jobjectArray {
     let mut recs: Vec<String> = vec![];
@@ -94,13 +95,18 @@ pub extern "system" fn Java_app_akhripasta_Core_snapshot(mut env: JNIEnv, _: JOb
             recs.push(format!("O{SEP}{}{SEP}{}", o.id as i64, clean(&o.summary)));
         }
         for j in e.jobs() {
-            let failed = matches!(j.t.state(), akhri_core::net::State::Failed(_));
+            use akhri_core::net::State;
+            let state = match j.t.state() {
+                State::Waiting => 'w',
+                State::Running => 'r',
+                State::Done => 'd',
+                State::Failed(_) => 'f',
+            };
             recs.push(format!(
-                "J{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}",
+                "J{SEP}{}{SEP}{}{SEP}{state}{SEP}{}{SEP}{}{SEP}{}",
                 j.id as i64,
                 clean(&j.label),
-                j.active() as u8,
-                failed as u8,
+                j.incoming as u8,
                 j.fraction(),
                 clean(&j.status())
             ));

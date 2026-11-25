@@ -2,6 +2,7 @@ package app.akhripasta
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.DownloadManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -12,9 +13,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.content.res.Configuration
-import android.graphics.Color
-import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -24,15 +23,19 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
 import android.provider.Settings
-import android.text.Editable
-import android.text.TextWatcher
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.AbsoluteSizeSpan
+import android.text.style.ForegroundColorSpan
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
-import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -40,69 +43,79 @@ import java.io.File
 import kotlin.concurrent.thread
 
 /** A file (content uri) or text waiting to be sent. */
-class Staged(val uri: Uri?, val text: String?, val label: String)
+class Staged(val uri: Uri?, val text: String?, val label: String, val size: Long?)
 
 class MainActivity : Activity() {
     private val staged = ArrayList<Staged>()
+    private lateinit var prefs: android.content.SharedPreferences
+    private lateinit var glow: View
+    private lateinit var nameView: TextView
+    private lateinit var avatarView: TextView
+    private lateinit var headline: TextView
     private lateinit var errorView: TextView
     private lateinit var offersBox: LinearLayout
-    private lateinit var stagedBox: LinearLayout
-    private lateinit var devicesBox: LinearLayout
-    private lateinit var jobsBox: LinearLayout
+    private lateinit var dockBox: LinearLayout
+    private lateinit var devicesCard: LinearLayout
+    private lateinit var activityCard: LinearLayout
+    private lateinit var col: LinearLayout
     private var multicast: WifiManager.MulticastLock? = null
-
-    private val Int.dp get() = (this * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val prefs = getSharedPreferences("akhri", MODE_PRIVATE)
+        prefs = getSharedPreferences("akhri", MODE_PRIVATE)
         val name = prefs.getString("name", null)
             ?: Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) ?: Build.MODEL
         @Suppress("DEPRECATION")
         val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AkhriPasta")
 
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16.dp, 8.dp, 16.dp, 16.dp) }
-        errorView = TextView(this).apply { setTextColor(Color.rgb(0xd3, 0x2f, 0x2f)); visibility = View.GONE }
-        col.addView(errorView)
-        offersBox = box(col)
-        col.addView(row(heading("To send"), button("Files") { pickFiles() }, button("Paste") { paste() }, button("Clear") { staged.clear(); renderStaged() }))
-        stagedBox = box(col)
-        col.addView(heading("Devices"))
-        devicesBox = box(col)
-        col.addView(row(heading("Transfers"), button("Downloads") { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }, button("Clear done") { Core.clearFinished() }))
-        jobsBox = box(col)
-        col.addView(heading("Settings"))
-        col.addView(EditText(this).apply {
-            setText(name)
-            hint = "Device name"
-            isSingleLine = true
-            addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun afterTextChanged(s: Editable?) {
-                    val n = s.toString().trim()
-                    if (n.isNotEmpty()) {
-                        prefs.edit().putString("name", n).apply()
-                        Core.setName(n)
-                    }
-                }
-            })
-        })
-        col.addView(TextView(this).apply { text = "Received files go to Download/AkhriPasta." })
+        // Soft cobalt wash from the top-left; brighter while something is offered or moving.
+        glow = View(this).apply {
+            background = GradientDrawable().apply {
+                gradientType = GradientDrawable.RADIAL_GRADIENT
+                colors = intArrayOf(C.COBALT and 0x66FFFFFF, C.COBALT and 0x22FFFFFF, C.COBALT and 0x00FFFFFF)
+                setGradientCenter(0.2f, 0f)
+                gradientRadius = dp(460f)
+            }
+            alpha = 0.6f
+        }
 
-        val scroll = ScrollView(this).apply { addView(col) }
-        // targetSdk 35+ draws edge to edge: keep content clear of the status bar, nav bar and keyboard.
+        avatarView = avatar(name, 44, C.INK, C.LIME)
+        nameView = tv(name, 16f, 600, C.INK)
+        val top = row(
+            avatarView,
+            column(nameView, tv("Visible on this network", 13f, 500, 0xFF3D4152.toInt()).margins(t = dp(3))).weight1().margins(l = dp(12)),
+            round(Ic.Folder, "Received files", 48, Tone.Ground) { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) },
+            round(Ic.Sliders, "Settings", 48, Tone.Ground) { rename(dir) }.margins(l = dp(8)),
+        )
+        headline = tv("", 30f, 650, C.INK, lines = 0).apply { letterSpacing = -0.02f; setLineSpacing(0f, 1.08f) }
+        errorView = tv("", 14f, 500, C.RED, lines = 0).apply {
+            background = rounded(C.RED_BG, 16f); setPadding(dp(14), dp(12), dp(14), dp(12)); visibility = View.GONE
+        }
+        offersBox = column()
+        dockBox = column().apply { background = rounded(C.COBALT, 28f); setPadding(dp(14), dp(14), dp(14), dp(14)) }
+        devicesCard = card()
+        activityCard = card()
+
+        col = column(
+            top, headline.margins(t = dp(28)), errorView.margins(t = dp(16)), offersBox.margins(t = dp(20)),
+            dockBox, devicesCard.margins(t = dp(14)), activityCard.margins(t = dp(14)),
+        ).apply { setPadding(dp(20), dp(12), dp(20), dp(28)) }
+        val scroll = ScrollView(this).apply { addView(col); isVerticalScrollBarEnabled = false }
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(C.BG)
+            addView(glow, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(520)))
+            addView(scroll)
+        }
+        // Edge to edge: the glow runs under the status bar, content stays clear of bars and keyboard.
         scroll.setOnApplyWindowInsetsListener { v, insets ->
             val i = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
             v.setPadding(i.left, i.top, i.right, i.bottom)
             insets
         }
-        setContentView(scroll)
-        // Dark status/nav bar icons on the light theme, so they stay readable.
-        if (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK != Configuration.UI_MODE_NIGHT_YES) {
-            val light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-            window.insetsController?.setSystemBarsAppearance(light, light)
-        }
+        setContentView(root)
+        val light = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        window.insetsController?.setSystemBarsAppearance(light, light)
+        window.isNavigationBarContrastEnforced = false
 
         Core.start(name, dir.path)?.let { errorView.text = it; errorView.visibility = View.VISIBLE }
         startWatcher(applicationContext)
@@ -156,7 +169,7 @@ class MainActivity : Activity() {
             }
         }
         intent?.action = null // don't stage again on rotation/resume
-        renderStaged()
+        render()
     }
 
     private fun pickFiles() {
@@ -173,7 +186,7 @@ class MainActivity : Activity() {
         if (requestCode != PICK || resultCode != RESULT_OK || data == null) return
         val clip = data.clipData
         if (clip != null) for (i in 0 until clip.itemCount) stageUri(clip.getItemAt(i).uri) else data.data?.let { stageUri(it) }
-        renderStaged()
+        render()
     }
 
     private fun paste() {
@@ -183,23 +196,23 @@ class MainActivity : Activity() {
             val item = clip.getItemAt(i)
             if (item.uri != null) stageUri(item.uri) else stageText(item.coerceToText(this).toString())
         }
-        renderStaged()
+        render()
     }
 
     private fun stageUri(uri: Uri) {
-        staged += Staged(uri, null, displayName(uri))
+        var name: String? = null
+        var size: Long? = null
+        runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) { name = c.getString(0); if (!c.isNull(1)) size = c.getLong(1) }
+            }
+        }
+        staged += Staged(uri, null, name ?: uri.lastPathSegment ?: "file", size)
     }
 
     private fun stageText(t: String) {
-        if (t.isNotEmpty()) staged += Staged(null, t, "Text: " + t.take(50).replace('\n', ' '))
+        if (t.isNotEmpty()) staged += Staged(null, t, t.take(80).replace(Regex("\\s+"), " "), t.toByteArray().size.toLong())
     }
-
-    private fun displayName(uri: Uri): String =
-        runCatching {
-            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getString(0) else null
-            }
-        }.getOrNull() ?: uri.lastPathSegment ?: "file"
 
     private fun send(peer: Peer) {
         val fds = ArrayList<Int>()
@@ -213,76 +226,218 @@ class MainActivity : Activity() {
         if (fds.isEmpty() && texts.isEmpty()) return
         Core.send(peer.id, fds.toIntArray(), names.toTypedArray(), texts.toTypedArray())
         staged.clear()
-        renderStaged()
+        render()
+    }
+
+    private fun rename(dir: File) {
+        val input = EditText(this).apply {
+            setText(nameView.text); setSelection(text.length); isSingleLine = true
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+        }
+        val box = FrameLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(input) }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
+            .setTitle("Device name")
+            .setMessage("Other devices see this name. Received files are saved to Download/${dir.name}.")
+            .setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                val n = input.text.toString().trim()
+                if (n.isNotEmpty()) {
+                    prefs.edit().putString("name", n).apply()
+                    Core.setName(n)
+                    nameView.text = n
+                    avatarView.text = initial(n)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     // ---------- rendering ----------
 
-    private fun renderStaged() {
-        stagedBox.removeAllViews()
-        if (staged.isEmpty()) stagedBox.addView(hint("Tap Files, Paste, or use Share → Akhri Pasta in any app."))
-        for (s in staged.toList()) {
-            stagedBox.addView(row(text(s.label), button("x") { staged.remove(s); renderStaged() }))
+    private fun card() = column().apply { background = rounded(C.CARD, 24f); setPadding(dp(18), dp(16), dp(18), dp(16)) }
+
+    /** Two-tone headline that names the current step. Mirrors `headline()` in desktop/src/main.rs. */
+    private fun headlineText(peers: Int, items: Int): CharSequence {
+        fun count(n: Int, what: String) = "$n $what${if (n == 1) "" else "s"}"
+        val (strong, rest) = when {
+            peers == 0 -> "Searching" to " for devices on this network…"
+            items == 0 -> count(peers, "device") to " nearby. Share something to send."
+            else -> count(items, "item") to " ready. Pick a device."
         }
-        render()
+        return SpannableStringBuilder(strong + rest).apply {
+            setSpan(ForegroundColorSpan(C.MUTED), strong.length, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
     }
 
     fun render() {
         val snap = snap
+        headline.text = headlineText(snap.peers.size, staged.size)
+        val target = when {
+            snap.offers.isNotEmpty() -> 1f
+            snap.jobs.any { it.active } -> 0.85f
+            snap.peers.isEmpty() -> 0.5f
+            else -> 0.65f
+        }
+        if (glow.alpha != target) glow.animate().alpha(target).setDuration(600).start()
+
         offersBox.removeAllViews()
-        for (o in snap.offers) {
-            offersBox.addView(LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(12.dp, 12.dp, 12.dp, 12.dp)
-                setBackgroundColor(Color.argb(40, 0x3d, 0x7e, 0xff))
-                addView(text(o.summary).apply { setTypeface(typeface, Typeface.BOLD) })
-                addView(row(button("Accept") { Core.decide(o.id, true) }, button("Decline") { Core.decide(o.id, false) }))
-            })
-        }
-        devicesBox.removeAllViews()
-        if (snap.peers.isEmpty()) devicesBox.addView(hint("Looking for devices on this Wi-Fi…"))
-        for (p in snap.peers) {
-            devicesBox.addView(Button(this).apply {
-                text = "Send to ${p.name}"
-                isAllCaps = false
-                isEnabled = staged.isNotEmpty()
-                contentDescription = "Send to ${p.name} at ${p.ip}"
-                setOnClickListener { send(p) }
-            })
-        }
-        jobsBox.removeAllViews()
-        for (j in snap.jobs) {
-            jobsBox.addView(text(j.label).apply { setTypeface(typeface, Typeface.BOLD) })
-            if (j.active && j.fraction < 1f && j.status.contains('/')) {
-                jobsBox.addView(ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-                    max = 1000
-                    progress = (j.fraction * 1000).toInt()
-                })
-            }
-            val status = text(j.status).apply { if (j.failed) setTextColor(Color.rgb(0xd3, 0x2f, 0x2f)) }
-            jobsBox.addView(if (j.active) row(status, button("Cancel") { Core.cancel(j.id) }) else status)
+        for (o in snap.offers) offersBox.addView(offerTicket(o).margins(b = dp(14)))
+        // While something is offered or moving and nothing is staged, the dock shrinks to one
+        // row and live transfers take its place above Devices.
+        val live = snap.jobs.any { it.active }
+        renderDock(staged.isEmpty() && (live || snap.offers.isNotEmpty()))
+        renderDevices(snap.peers)
+        renderActivity(snap.jobs)
+        val (first, second) = if (live) activityCard to devicesCard else devicesCard to activityCard
+        if (col.indexOfChild(first) > col.indexOfChild(second)) {
+            col.removeView(first)
+            col.addView(first, col.indexOfChild(second))
         }
     }
 
-    private fun box(parent: LinearLayout) = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; parent.addView(this) }
-    private fun text(s: String) = TextView(this).apply { text = s; textSize = 15f }
-    private fun hint(s: String) = text(s).apply { alpha = 0.6f }
-    private fun heading(s: String) = TextView(this).apply {
-        text = s; textSize = 20f; setTypeface(typeface, Typeface.BOLD); setPadding(0, 16.dp, 0, 4.dp)
+    private fun offerTicket(o: Offer) = Ticket(this).apply {
+        top.addView(row(badge(Ic.Down, C.LIME, C.INK, 44), tv(o.summary, 16f, 500, C.INK, lines = 0).weight1().margins(l = dp(12))))
+        stub.addView(row(
+            column(tv("Saves to", 12f, 400, C.MUTED), tv("Download/AkhriPasta", 14f, 500, C.INK).margins(t = dp(3))).weight1(),
+            pill("Decline", null, Tone.Card) { Core.decide(o.id, false) },
+            pill("Accept", Ic.Check, Tone.Ink) { Core.decide(o.id, true) }.margins(l = dp(8)),
+        ))
     }
-    private fun button(s: String, onClick: () -> Unit) = Button(this).apply { text = s; isAllCaps = false; setOnClickListener { onClick() } }
-    private fun row(first: View, vararg rest: View) = LinearLayout(this).apply {
-        gravity = android.view.Gravity.CENTER_VERTICAL
-        addView(first, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        rest.forEach { addView(it) }
+
+    private fun renderDock(compact: Boolean) {
+        dockBox.removeAllViews()
+        if (compact) {
+            dockBox.addView(row(
+                round(Ic.Plus, "Pick files", 44, Tone.Lime) { pickFiles() },
+                pill("Files", Ic.File, Tone.Glass) { pickFiles() }.margins(l = dp(4)),
+                pill("Paste", Ic.Paste, Tone.Glass) { paste() }.margins(l = dp(8)),
+                gravity = Gravity.CENTER,
+            ))
+            return
+        }
+        if (staged.isEmpty()) {
+            dockBox.addView(column(
+                round(Ic.Plus, "Pick files", 58, Tone.Lime) { pickFiles() }.margins(t = dp(14)),
+                tv("Share or pick files", 18f, 600, C.WHITE).margins(t = dp(14)),
+                tv("Or tap Share → Akhri Pasta in any app", 14f, 400, C.ON_COBALT_MUTED).margins(t = dp(6), b = dp(16)),
+            ).apply { gravity = Gravity.CENTER_HORIZONTAL; layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) })
+        } else {
+            dockBox.addView(outgoingTicket().margins(b = dp(12)))
+        }
+        dockBox.addView(row(
+            pill("Files", Ic.File, Tone.Glass) { pickFiles() },
+            pill("Paste", Ic.Paste, Tone.Glass) { paste() }.margins(l = dp(8)),
+            gravity = Gravity.CENTER,
+        ).apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) })
     }
+
+    private fun outgoingTicket() = Ticket(this).apply {
+        top.addView(row(
+            tv("Outgoing", 20f, 600, C.INK).weight1(),
+            round(Ic.Close, "Clear all", 40, Tone.Card) { staged.clear(); render() },
+        ))
+        for (s in staged.take(MAX_ROWS)) {
+            val size = s.size?.let { human(it) } ?: ""
+            top.addView(row(
+                glyph(if (s.text != null) Ic.Text else Ic.File, C.MUTED, 20),
+                tv(s.label, 15f, 500, C.INK).weight1().margins(l = dp(10), r = dp(8)),
+                tv(size, 13f, 400, C.MUTED),
+                round(Ic.Close, "Remove ${s.label}", 40, Tone.Ground) { staged.remove(s); render() }.margins(l = dp(4)),
+            ).margins(t = dp(6)))
+        }
+        if (staged.size > MAX_ROWS) top.addView(tv("+${staged.size - MAX_ROWS} more", 14f, 500, C.MUTED).margins(t = dp(6)))
+        val total = staged.mapNotNull { it.size }.sum()
+        val seed = staged.fold(-0x340d631b7bdddcdbL) { h, s -> s.label.fold(h) { a, ch -> (a xor ch.code.toLong()) * 0x100000001b3L } }
+        stub.addView(row(
+            column(
+                Barcode(context, seed).apply { layoutParams = LinearLayout.LayoutParams(dp(150), dp(34)) },
+                tv("${staged.size} item${if (staged.size == 1) "" else "s"}", 12f, 500, C.MUTED).margins(t = dp(5)),
+            ).weight1(),
+            column(
+                tv(if (staged.any { it.size == null }) "Total, some unknown" else "Total", 12f, 400, C.MUTED),
+                tv(if (total > 0) human(total) else "—", 20f, 600, C.INK).margins(t = dp(3)),
+            ).apply { gravity = Gravity.END },
+            gravity = Gravity.BOTTOM,
+        ))
+    }
+
+    private fun sectionTitle(title: String, count: String?, action: View? = null) = row(
+        tv(title, 17f, 600, C.INK),
+        tv(count ?: "", 17f, 400, C.MUTED).weight1().margins(l = dp(6)),
+        *listOfNotNull(action).toTypedArray(),
+    ).margins(b = dp(8))
+
+    private fun renderDevices(peers: List<Peer>) {
+        devicesCard.removeAllViews()
+        devicesCard.addView(sectionTitle("Devices", peers.size.takeIf { it > 0 }?.toString()))
+        if (peers.isEmpty()) {
+            devicesCard.addView(tv("Nothing here yet. Open Akhri Pasta on another device on the same network and it appears within a few seconds.", 14f, 400, C.MUTED, lines = 0))
+        }
+        val ready = staged.isNotEmpty()
+        peers.forEachIndexed { i, p ->
+            if (i > 0) devicesCard.addView(hairline())
+            devicesCard.addView(row(
+                avatar(p.name, 44, C.RAISED, C.INK),
+                column(tv(p.name, 16f, 600, C.INK), tv(p.ip, 13f, 400, C.MUTED).margins(t = dp(3))).weight1().margins(l = dp(12), r = dp(8)),
+                round(Ic.UpRight, if (ready) "Send to ${p.name}" else "Add files or text first", 52, Tone.Lime, ready) { send(p) },
+            ))
+        }
+    }
+
+    private fun renderActivity(jobs: List<Job>) {
+        activityCard.removeAllViews()
+        val clear = if (jobs.any { !it.active }) tv("Clear finished", 14f, 500, C.MUTED).apply {
+            minHeight = dp(48); gravity = Gravity.CENTER_VERTICAL; setPadding(dp(12), 0, 0, 0)
+            setOnClickListener { Core.clearFinished() }
+        } else null
+        activityCard.addView(sectionTitle("Activity", null, clear))
+        if (jobs.isEmpty()) activityCard.addView(tv("Nothing sent or received yet.", 14f, 400, C.MUTED))
+        jobs.forEachIndexed { i, j ->
+            if (i > 0) activityCard.addView(hairline())
+            val arrow = if (j.incoming) Ic.Down else Ic.Up
+            val (icon, fg, bg) = when (j.state) {
+                'w' -> Triple(arrow, C.AMBER, C.AMBER_BG)
+                'r' -> Triple(arrow, C.WHITE, C.COBALT)
+                'd' -> Triple(Ic.Check, C.GREEN, C.GREEN_BG)
+                else -> Triple(Ic.Close, C.RED, C.RED_BG)
+            }
+            activityCard.addView(row(
+                badge(icon, fg, bg, 44),
+                column(tv(j.label, 15f, 600, C.INK), tv(j.status, 13f, 400, if (j.failed) C.RED else C.MUTED).margins(t = dp(3)))
+                    .weight1().margins(l = dp(12), r = dp(8)),
+                *listOfNotNull(if (j.active) round(Ic.Close, "Cancel", 40, Tone.Card) { Core.cancel(j.id) } else null).toTypedArray(),
+            ))
+            if (j.state == 'r') {
+                val pct = (j.fraction * 100).toInt().toString()
+                val num = SpannableStringBuilder("$pct%").apply {
+                    setSpan(AbsoluteSizeSpan(16, true), pct.length, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    setSpan(ForegroundColorSpan(C.MUTED), pct.length, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
+                activityCard.addView(row(
+                    tv(num, 34f, 300, C.INK),
+                    Ticks(this).apply { fraction = j.fraction }.weight1().margins(l = dp(12)),
+                ).margins(t = dp(8)))
+            }
+        }
+    }
+
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
     companion object {
         private const val PICK = 1
+        private const val MAX_ROWS = 6
         @Volatile var ui: MainActivity? = null
         @Volatile var snap = Snap(emptyArray())
         private var watching = false
+
+        /** Same as core `human()`, for sizes of staged items before they reach the engine. */
+        fun human(b: Long): String {
+            val units = arrayOf("B", "KB", "MB", "GB", "TB")
+            var v = b.toDouble()
+            var i = 0
+            while (v >= 1024 && i < units.size - 1) { v /= 1024; i++ }
+            return if (i == 0) "$b B" else "%.1f %s".format(v, units[i])
+        }
 
         /** One background thread per process: waits on the engine, refreshes the UI,
          *  copies received text, and notifies about offers while the app isn't open. */
@@ -319,6 +474,7 @@ class MainActivity : Activity() {
             )
             val n = Notification.Builder(app, "offers")
                 .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setColor(C.COBALT)
                 .setContentTitle("Incoming files")
                 .setContentText(o.summary)
                 .setContentIntent(open)

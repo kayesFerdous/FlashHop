@@ -76,6 +76,7 @@ pub struct Transfer {
     started: OnceLock<Instant>,
     ended: OnceLock<Instant>,
     sock: Mutex<Option<TcpStream>>,
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Transfer {
@@ -87,7 +88,7 @@ impl Default for Transfer {
 impl Transfer {
     pub fn new() -> Self {
         let (started, ended) = Default::default();
-        Self { done: 0.into(), total: 0.into(), state: Mutex::new(State::Waiting), started, ended, sock: Mutex::new(None) }
+        Self { done: 0.into(), total: 0.into(), state: Mutex::new(State::Waiting), started, ended, sock: Mutex::new(None), cancelled: false.into() }
     }
     /// Bytes per second since the receiver accepted.
     pub fn speed(&self) -> f64 {
@@ -97,6 +98,7 @@ impl Transfer {
     }
     /// Unblocks any read/write on both ends; the worker thread then fails out.
     pub fn cancel(&self) {
+        self.cancelled.store(true, Relaxed);
         if let Some(s) = &*self.sock.lock().unwrap() {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -119,10 +121,25 @@ impl Transfer {
                 Some(v)
             }
             Err(e) => {
-                self.set(State::Failed(e.to_string()));
+                self.set(State::Failed(if self.cancelled.load(Relaxed) { "Cancelled".into() } else { describe(&e) }));
                 None
             }
         }
+    }
+}
+
+/// The one-line reason both UIs show for a failed transfer: the problem and what to check.
+fn describe(e: &io::Error) -> String {
+    use io::ErrorKind::*;
+    match e.kind() {
+        ConnectionRefused => "Couldn't connect. Is Akhri Pasta open on the other device?".into(),
+        TimedOut | WouldBlock => "Timed out. Are both devices on the same network?".into(),
+        HostUnreachable | NetworkUnreachable | AddrNotAvailable => "Can't reach that device from this network.".into(),
+        ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof => "Stopped: the connection closed.".into(),
+        StorageFull => "Not enough storage space.".into(),
+        PermissionDenied => "No permission to save there.".into(),
+        _ if e.to_string() == "declined" => "Declined".into(),
+        _ => e.to_string(),
     }
 }
 

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-25T22:20:00Z",
+  "title": "Design System: Akhri Pasta",
+  "extensions": {
+    "colorMeta": {
+      "ground-lavender": { "role": "neutral", "displayName": "Ground Lavender", "canonical": "#E9EBF5" },
+      "card-white": { "role": "neutral", "displayName": "Card White", "canonical": "#FFFFFF" },
+      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#0E0F14" },
+      "muted-slate": { "role": "neutral", "displayName": "Muted Slate", "canonical": "#585D70" },
+      "dock-cobalt": { "role": "primary", "displayName": "Dock Cobalt", "canonical": "#2F55E4" },
+      "go-lime": { "role": "secondary", "displayName": "Go Lime", "canonical": "#D6F55B" }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Headline", "purpose": "Two-tone step sentence under the top bar." },
+      "numeral": { "displayName": "Numeral", "purpose": "Live transfer percentage only." }
+    },
+    "shadows": [],
+    "motion": [
+      { "name": "hover", "value": "120ms linear colour lerp", "purpose": "Pill and round-button hover on desktop." },
+      { "name": "glow", "value": "600ms ease to new strength", "purpose": "Top wash brightens with offers and transfers." }
+    ],
+    "breakpoints": [
+      { "name": "desktop-min", "value": "360px window; pills drop icons when the dock is narrower than their row" },
+      { "name": "desktop-max-column", "value": "560px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Pill", "kind": "button", "refersTo": "button-primary",
+      "description": "Black pill for the main action on white or lavender (Accept, Change…).",
+      "html": "<button class=\"ap-pill\">Accept</button>",
+      "css": ".ap-pill{background:#0E0F14;color:#fff;border:0;border-radius:999px;height:38px;padding:0 17px;font:600 13.5px Inter,sans-serif}.ap-pill:hover{background:#2A2C36}"
+    },
+    {
+      "name": "Send Button", "kind": "button", "refersTo": "send-round",
+      "description": "Lime circle with an up-right arrow, one per device row.",
+      "html": "<button class=\"ap-send\" aria-label=\"Send to Pixel 8\">↗</button>",
+      "css": ".ap-send{width:44px;height:44px;border-radius:50%;border:0;background:#D6F55B;color:#0E0F14;font-size:18px}.ap-send:disabled{background:#EEF0F7;color:#9A9EAD}"
+    },
+    {
+      "name": "Ticket", "kind": "card", "refersTo": "ticket",
+      "description": "White ticket with side notches and a dashed perforation; holds staged items or an incoming offer.",
+      "html": "<div class=\"ap-dock\"><div class=\"ap-ticket\"><b>Outgoing</b><div>Q3-report.pdf · 2.4 MB</div><hr><div>3 items · 2.0 GB</div></div></div>",
+      "css": ".ap-dock{background:#2F55E4;border-radius:28px;padding:14px}.ap-ticket{background:#fff;border-radius:22px;padding:16px 18px;font:500 14px Inter,sans-serif;color:#0E0F14;-webkit-mask:radial-gradient(circle 11px at 0 62%,transparent 98%,#000) left/51% 100% no-repeat,radial-gradient(circle 11px at 100% 62%,transparent 98%,#000) right/51% 100% no-repeat}.ap-ticket hr{border:0;border-top:1.5px dashed #B9C7F6;margin:12px 0}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Boarding Pass",
+    "rules": ["Lime is go, cobalt is sending; neither decorates.", "Flat: tone separates layers, never shadows.", "Offer and status wording comes from core."]
+  }
+}

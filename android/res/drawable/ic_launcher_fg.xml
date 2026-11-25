@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Mark: a white ticket with an up-right arrow. Same geometry as app_icon() in desktop/src/ui.rs,
+     kept inside the 66 dp adaptive-icon safe circle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M32,36 H58.5 A5.5,5.5 0 0 0 69.5,36 H76 A7,7 0 0 1 83,43 V65 A7,7 0 0 1 76,72 H69.5 A5.5,5.5 0 0 0 58.5,72 H32 A7,7 0 0 1 25,65 V43 A7,7 0 0 1 32,36 Z" />
+    <path android:fillColor="#2F55E4" android:pathData="M63,44 h2 v4 h-2 Z M63,52 h2 v4 h-2 Z M63,60 h2 v4 h-2 Z" />
+    <path android:strokeColor="#2F55E4" android:strokeWidth="4.5" android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M37,61 L51,47 M43,47 L51,47 L51,55" />
+</vector>

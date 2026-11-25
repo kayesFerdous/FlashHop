@@ -1,15 +1,19 @@
 [package]
 name = "akhri_pasta"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 akhri_core = { path = "../core" }
 # glow (OpenGL) instead of wgpu: much smaller binary. Linux is forced onto X11/XWayland
 # in main.rs because winit has no Wayland drag-and-drop.
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "x11", "default_fonts", "clipboard", "accesskit"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "x11", "clipboard", "accesskit"] }
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] } # file lists, images
 png = "0.18"                                              # clipboard image -> .png
+# Native file picker. Linux: xdg-desktop-portal over D-Bus (zbus is already in the tree via
+# accesskit), so it works on GNOME, KDE, and wlroots without GTK. macOS: NSOpenPanel.
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+pollster = "1"                                            # waits on rfd's dialog future off the UI thread
 
 # Already pulled in by eframe; listed only to force the X11 backend (see main.rs).
 [target.'cfg(target_os = "linux")'.dependencies]

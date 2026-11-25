@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds android/akhri_pasta.apk without Gradle, in seconds:
-#   cargo (shared Rust core) -> kotlinc -> R8 -> aapt2 -> zipalign -> apksigner
+#   cargo (shared Rust core) -> kotlinc -> aapt2 (res: app icon) -> R8 -> zipalign -> apksigner
 # Needs: Android SDK (+NDK), a JDK, and the Rust Android toolchain + kotlinc from
 # ./setup-tools.sh (kept in ~/.local/share/akhri-android, separate from your normal Rust).
 set -eu
@@ -26,7 +26,8 @@ done
 
 # 2. Kotlin -> classes -> one dex. R8 shrinks the Kotlin stdlib to what's actually used.
 "$TOOLS/kotlinc/bin/kotlinc" src -cp "$JAR" -no-jdk -no-reflect -jvm-target 17 -nowarn -d $OUT/classes.jar
-"$BT/aapt2" link -o $OUT/app.apk -I "$JAR" --manifest AndroidManifest.xml --proguard $OUT/aapt-rules.pro
+"$BT/aapt2" compile --dir res -o $OUT/res.zip
+"$BT/aapt2" link -o $OUT/app.apk -I "$JAR" --manifest AndroidManifest.xml --proguard $OUT/aapt-rules.pro $OUT/res.zip
 java -cp "$BT/lib/d8.jar" com.android.tools.r8.R8 --release --min-api 30 --lib "$JAR" \
   --pg-conf rules.pro --pg-conf $OUT/aapt-rules.pro --output $OUT/apk \
   $OUT/classes.jar "$TOOLS/kotlinc/lib/kotlin-stdlib.jar"

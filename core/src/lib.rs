@@ -35,6 +35,8 @@ pub struct Offer {
 pub struct Job {
     pub id: u64,
     pub label: String,
+    /// Received (true) or sent (false).
+    pub incoming: bool,
     pub t: Arc<Transfer>,
 }
 
@@ -46,9 +48,10 @@ impl Job {
     pub fn status(&self) -> String {
         let (done, total) = (self.t.done.load(Relaxed), self.t.total.load(Relaxed));
         match self.t.state() {
-            State::Waiting => "waiting for accept…".into(),
+            State::Waiting if self.incoming => "Starting…".into(),
+            State::Waiting => "Waiting for the other device to accept…".into(),
             State::Running => format!("{} / {}  {}/s", human(done), human(total), human(self.t.speed() as u64)),
-            State::Done => format!("done, {}", human(total)),
+            State::Done => format!("{}, {}", if self.incoming { "Received" } else { "Sent" }, human(total)),
             State::Failed(e) => e,
         }
     }
@@ -111,7 +114,7 @@ impl Engine {
         let texts = net::receive(conn, &dir, &t, |o| {
             let (reply, decision) = mpsc::channel();
             let offer = Offer { id: self.next_id(), summary: summarize(o) };
-            let job = Job { id: self.next_id(), label: format!("From {}", o.from), t: t.clone() };
+            let job = Job { id: self.next_id(), label: format!("From {}", o.from), incoming: true, t: t.clone() };
             self.pending.lock().unwrap().push(Pending { offer, reply, job });
             self.changed();
             decision.recv().unwrap_or(false)
@@ -124,7 +127,7 @@ impl Engine {
     pub fn send(self: &Arc<Self>, peer: u64, items: Vec<Item>) {
         let Some((name, ip)) = self.peers.lock().unwrap().get(&peer).map(|p| (p.name.clone(), p.ip)) else { return };
         let t = Arc::new(Transfer::new());
-        self.jobs.lock().unwrap().push(Job { id: self.next_id(), label: format!("To {name}"), t: t.clone() });
+        self.jobs.lock().unwrap().push(Job { id: self.next_id(), label: format!("To {name}"), incoming: false, t: t.clone() });
         let (e, me) = (self.clone(), self.name.lock().unwrap().clone());
         thread::spawn(move || {
             net::send(SocketAddr::new(ip, net::PORT), &me, items, &t);

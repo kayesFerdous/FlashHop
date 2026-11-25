@@ -29,9 +29,9 @@ Only one instance can run per machine, because UDP and TCP both bind the fixed p
 
 ```
 core/          akhri_core, std only. net.rs = wire protocol, lib.rs = Engine (all app behavior)
-desktop/       akhri_pasta binary: egui screens over Engine
+desktop/       akhri_pasta binary: egui screens over Engine; ui.rs = tokens, Inter weights, custom widgets
 android/rust/  cdylib "akhri": JNI bridge only, no logic
-android/src/   Kotlin screens; Core.kt declares the JNI functions and parses snapshots
+android/src/   Kotlin screens; Core.kt declares the JNI functions and parses snapshots; Ui.kt = tokens + custom views
 ```
 
 **Sync rule:** behavior and every user-visible string live in `core`: discovery, offers, transfers, progress, file naming, `summarize()`, `Job::status()`, `human()`. Platform code only renders and does platform I/O (clipboard, notifications, file pickers, config). If both UIs would need the same change, it belongs in `core`.
@@ -50,23 +50,28 @@ android/src/   Kotlin screens; Core.kt declares the JNI functions and parses sna
 
 **JNI contract** (`android/rust/src/lib.rs` ↔ `android/src/app/akhripasta/Core.kt`). Change both sides together:
 - Function names are `Java_app_akhripasta_Core_<method>`, with Kotlin `object Core` and the package `app.akhripasta`.
-- `snapshot()` returns `Array<String>`, one record per element, fields split by U+001F: `P id name ip`, `O id summary`, `J id label active failed fraction status`, `T text`. The `Snap` class parses these.
+- `snapshot()` returns `Array<String>`, one record per element, fields split by U+001F: `P id name ip`, `O id summary`, `J id label state incoming fraction status` (state is `w`/`r`/`d`/`f`), `T text`. The `Snap` class parses these.
 - `snapshot()` drains received texts (`take_texts`), so only the watcher thread may call it.
 - u64 ids cross JNI as `jlong` bit patterns.
 - The cdylib sets SIGPIPE to ignore itself, because a cdylib doesn't get Rust's usual runtime setup.
 
 **Desktop specifics:**
 - eframe uses `glow` (not wgpu) for size.
+- Fonts: eframe's `default_fonts` is off; `desktop/assets/Inter.ttf` (variable, OFL) is the only font. Weights come from its `wght`/`opsz` axes as named families (`ui::W`). No emoji/CJK fallback.
+- The window icon is rasterized at startup from the same geometry as `android/res/drawable/ic_launcher_fg.xml`.
 - Linux is forced onto X11/XWayland through `NativeOptions::event_loop_builder`, because winit has no Wayland drag-and-drop. Dropping eframe's `wayland` feature isn't enough: `accesskit_winit` turns winit's wayland feature back on.
 - Paste order: clipboard file list → text → image (re-encoded to a temp PNG).
+- **Files…/Folder…** use `rfd` with only the `xdg-portal` feature (Linux: the desktop's own file manager dialog over D-Bus, no GTK; macOS: NSOpenPanel). The dialog future is created on the UI thread (macOS needs that) and awaited on a worker thread with `pollster`, so the window keeps repainting.
 - Config lives in `~/.config/akhri_pasta/config` as `name=` / `dir=` lines.
 
 **Android specifics:**
 - No Gradle, no AndroidX, no Compose. Only platform widgets, built in code.
-- `build.sh` runs cargo → kotlinc → R8 (from build-tools `d8.jar`) → aapt2 → `jar` → zipalign `-P 16` → apksigner. Native libs are stored uncompressed (`extractNativeLibs=false`).
+- `build.sh` runs cargo → kotlinc → aapt2 (compiles `res/`, which holds only the adaptive app icon; Kotlin never references `R`) → R8 (from build-tools `d8.jar`) → `jar` → zipalign `-P 16` → apksigner. Native libs are stored uncompressed (`extractNativeLibs=false`).
 - R8 keep rules are in `android/rules.pro`.
 - minSdk 30 lets Rust write straight into `Download/AkhriPasta` with plain paths. targetSdk 36.
 - The Wi-Fi multicast lock is held only while the activity is visible.
+
+**Design:** light only. Palette, radii and components are mirrored between `desktop/src/ui.rs` and `android/src/app/akhripasta/Ui.kt` (same names: `Tone`, ticket, ticks, icons on a 24-unit grid); change both together. `DESIGN.md` records the system, `PRODUCT.md` the product facts.
 
 ## Testing on the emulator
 

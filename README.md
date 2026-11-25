@@ -37,9 +37,9 @@ format, bump it, and old and new builds will refuse each other instead of corrup
 
 ## Use
 
-**Desktop:** drop files or folders on the window, or press Ctrl+V / Cmd+V. Paste works with
-copied files, screenshots, and text. Then click **Send to <device>**.
-**Android:** tap **Share → Akhri Pasta** in any app (or use **Files** / **Paste**), then tap the device.
+**Desktop:** drop files or folders on the window, pick them with **Files…** / **Folder…**, or press
+Ctrl+V / Cmd+V. Paste works with copied files, screenshots, and text. Then click the lime arrow next to the device.
+**Android:** tap **Share → Akhri Pasta** in any app (or use **Files** / **Paste**), then tap the lime arrow next to the device.
 
 The receiver gets a notification and clicks **Accept**. Files go to `~/Downloads` on desktop
 and `Download/AkhriPasta` on Android. Received text goes straight to the receiver's clipboard.

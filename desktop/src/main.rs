@@ -1,22 +1,84 @@
-use akhri_core::{Engine, net::Item};
-use eframe::egui;
-use std::{fs, path::PathBuf, process::Command, sync::Arc, thread, time::Duration};
+mod ui;
+
+use akhri_core::{
+    Engine, Job, Offer, Peer, human,
+    net::{Item, State},
+};
+use eframe::egui::{self, Align, Label, Layout};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+use ui::{Icon, Tone, W};
 
 const APP: &str = "Akhri Pasta";
+/// Content column width; wider windows center it.
+const MAX_W: f32 = 560.0;
+/// Staged rows shown before "+N more".
+const MAX_ROWS: usize = 6;
+const PASTE_KEY: &str = if cfg!(target_os = "macos") { "Cmd+V" } else { "Ctrl+V" };
+
+enum Kind {
+    File,
+    Folder,
+    Text,
+}
+
+/// An item waiting to be sent, with what the ticket shows about it.
+struct Staged {
+    item: Item,
+    name: String,
+    kind: Kind,
+    size: Option<u64>,
+}
+
+impl Staged {
+    fn new(item: Item) -> Self {
+        let (name, kind, size) = match &item {
+            Item::Path(p) => {
+                let md = fs::metadata(p).ok();
+                let dir = md.as_ref().is_some_and(fs::Metadata::is_dir);
+                (file_name(p), if dir { Kind::Folder } else { Kind::File }, md.filter(|m| !m.is_dir()).map(|m| m.len()))
+            }
+            Item::Open(_, n) => (n.clone(), Kind::File, None),
+            Item::Text(t) => (t.chars().take(80).collect::<String>().replace(['\n', '\r', '\t'], " "), Kind::Text, Some(t.len() as u64)),
+        };
+        Self { item, name, kind, size }
+    }
+}
+
+enum Pick {
+    Files,
+    Folders,
+    SaveDir,
+}
 
 struct App {
     e: Arc<Engine>,
-    staged: Vec<Item>,
+    staged: Vec<Staged>,
     clip: Option<arboard::Clipboard>,
     error: Option<String>,
+    /// Filled by file-picker threads, drained into `staged` each frame.
+    picked: Arc<Mutex<Vec<PathBuf>>>,
+    /// Filled by the "Change…" folder picker in settings.
+    save_dir: Arc<Mutex<Option<PathBuf>>>,
+    settings: bool,
 }
 
 fn main() -> eframe::Result {
     let (name, dir) = load_config();
     // `akhri_pasta file1 folder2` stages them, so file-manager "Open with" works.
-    let staged = std::env::args_os().skip(1).map(|a| Item::Path(a.into())).collect();
+    let staged = std::env::args_os().skip(1).map(|a| Staged::new(Item::Path(a.into()))).collect();
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([420.0, 560.0]).with_app_id("akhri_pasta"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([440.0, 720.0])
+            .with_min_inner_size([360.0, 520.0])
+            .with_app_id("akhri_pasta")
+            .with_icon(ui::app_icon()),
         // winit has no Wayland drag-and-drop; XWayland bridges drops from Wayland apps.
         #[cfg(target_os = "linux")]
         event_loop_builder: Some(Box::new(|b| {
@@ -28,9 +90,18 @@ fn main() -> eframe::Result {
         APP,
         opts,
         Box::new(|cc| {
+            ui::setup(&cc.egui_ctx);
             let e = Engine::start(name, dir).map_err(|e| format!("Network error: {e} (is it already running?)"))?;
             watch(e.clone(), cc.egui_ctx.clone());
-            Ok(Box::new(App { e, staged, clip: arboard::Clipboard::new().ok(), error: None }))
+            Ok(Box::new(App {
+                e,
+                staged,
+                clip: arboard::Clipboard::new().ok(),
+                error: None,
+                picked: Default::default(),
+                save_dir: Default::default(),
+                settings: false,
+            }))
         }),
     )
 }
@@ -54,27 +125,43 @@ fn watch(e: Arc<Engine>, ctx: egui::Context) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
         self.handle_input(&ctx);
+        self.staged.extend(self.picked.lock().unwrap().drain(..).map(|p| Staged::new(Item::Path(p))));
+        if let Some(d) = self.save_dir.lock().unwrap().take() {
+            *self.e.dir.lock().unwrap() = d;
+            self.persist();
+        }
         for text in self.e.take_texts() {
             if let Some(c) = &mut self.clip {
                 let _ = c.set_text(text);
             }
         }
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(e) = &self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                }
-                self.offers_ui(ui);
-                self.staged_ui(ui);
-                ui.separator();
-                self.devices_ui(ui);
-                ui.separator();
-                self.jobs_ui(ui);
-                ui.separator();
-                self.settings_ui(ui);
+        let (peers, offers, jobs) = (self.e.peers(), self.e.offers(), self.e.jobs());
+        let hot = ctx.input(|i| !i.raw.hovered_files.is_empty());
+
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(ui::BG)).show(root, |ui| {
+            // The glow is the network's pulse: brighter while something is offered or moving.
+            let target = if !offers.is_empty() {
+                0.5
+            } else if self.e.busy() {
+                0.42
+            } else if peers.is_empty() {
+                0.24
+            } else {
+                0.32
+            };
+            let strength = ctx.animate_value_with_time(egui::Id::unique("glow"), target, 0.6);
+            ui::glow(&ctx, ctx.content_rect(), strength);
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                column(ui, |ui| {
+                    if self.settings {
+                        self.settings_ui(ui, frame);
+                    } else {
+                        self.main_ui(ui, frame, &peers, &offers, &jobs, hot);
+                    }
+                });
             });
         });
         if self.e.busy() {
@@ -83,16 +170,51 @@ impl eframe::App for App {
     }
 }
 
+/// Centers a column of at most `MAX_W` with side margins.
+fn column(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let full = ui.available_width();
+    let w = (full - 40.0).min(MAX_W);
+    ui.add_space(14.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space((full - w) / 2.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.set_width(w);
+            add(ui);
+            ui.add_space(28.0);
+        });
+    });
+}
+
+/// Two-tone headline that names the current step. Mirrored in MainActivity.headline().
+fn headline(peers: usize, staged: usize) -> (String, &'static str) {
+    let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    if peers == 0 {
+        ("Searching".into(), " for devices on this network…")
+    } else if staged == 0 {
+        (count(peers, "device"), " nearby. Drop something to send.")
+    } else {
+        (count(staged, "item"), " ready. Pick a device.")
+    }
+}
+
 impl App {
     fn handle_input(&mut self, ctx: &egui::Context) {
-        let (dropped, pasted) = ctx.input(|i| {
+        let (dropped, pasted, esc) = ctx.input(|i| {
             let dropped: Vec<PathBuf> = i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect();
             let pasted = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_) | egui::Event::PasteImage(_)));
-            (dropped, pasted)
+            (dropped, pasted, i.key_pressed(egui::Key::Escape))
         });
-        self.staged.extend(dropped.into_iter().map(Item::Path));
+        if !dropped.is_empty() {
+            self.settings = false;
+        }
+        self.staged.extend(dropped.into_iter().map(|p| Staged::new(Item::Path(p))));
         if pasted && !ctx.egui_wants_keyboard_input() {
             self.paste();
+        }
+        if esc {
+            self.settings = false;
         }
     }
 
@@ -102,139 +224,453 @@ impl App {
         if let Ok(files) = c.get().file_list()
             && !files.is_empty()
         {
-            self.staged.extend(files.into_iter().map(Item::Path));
+            self.staged.extend(files.into_iter().map(|p| Staged::new(Item::Path(p))));
         } else if let Ok(text) = c.get_text()
             && !text.is_empty()
         {
-            self.staged.push(Item::Text(text));
+            self.staged.push(Staged::new(Item::Text(text)));
         } else if let Ok(img) = c.get_image() {
             match save_png(img.width as u32, img.height as u32, &img.bytes) {
-                Ok(p) => self.staged.push(Item::Path(p)),
+                Ok(p) => self.staged.push(Staged::new(Item::Path(p))),
                 Err(e) => self.error = Some(format!("Could not save pasted image: {e}")),
             }
         }
     }
 
-    fn offers_ui(&mut self, ui: &mut egui::Ui) {
-        for o in self.e.offers() {
-            egui::Frame::group(ui.style()).fill(ui.visuals().selection.bg_fill.gamma_multiply(0.3)).show(ui, |ui| {
-                ui.label(egui::RichText::new(&o.summary).strong());
+    /// Opens the system file manager's picker. The dialog future is created here on the UI
+    /// thread (macOS requires that) and awaited on a worker so the window keeps repainting.
+    fn pick(&self, ctx: &egui::Context, frame: &eframe::Frame, what: Pick) {
+        type Fut = std::pin::Pin<Box<dyn Future<Output = Option<Vec<rfd::FileHandle>>> + Send>>;
+        let d = rfd::AsyncFileDialog::new().set_parent(frame);
+        let fut: Fut = match what {
+            Pick::Files => Box::pin(d.pick_files()),
+            Pick::Folders => Box::pin(d.pick_folders()),
+            Pick::SaveDir => {
+                let f = d.set_directory(&*self.e.dir.lock().unwrap()).pick_folder();
+                Box::pin(async move { f.await.map(|h| vec![h]) })
+            }
+        };
+        let (files, dir, ctx) = (self.picked.clone(), self.save_dir.clone(), ctx.clone());
+        let to_dir = matches!(what, Pick::SaveDir);
+        thread::spawn(move || {
+            let got: Vec<PathBuf> = pollster::block_on(fut).unwrap_or_default().iter().map(|f| f.path().to_path_buf()).collect();
+            if to_dir {
+                *dir.lock().unwrap() = got.into_iter().next();
+            } else {
+                files.lock().unwrap().extend(got);
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn persist(&self) {
+        save_config(&self.e.name.lock().unwrap(), &self.e.dir.lock().unwrap());
+    }
+
+    fn main_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, peers: &[Peer], offers: &[Offer], jobs: &[Job], hot: bool) {
+        self.top_bar(ui);
+        ui.add_space(28.0);
+        let (strong, rest) = headline(peers.len(), self.staged.len());
+        ui::headline(ui, &strong, rest);
+        ui.add_space(20.0);
+        for o in offers {
+            self.offer_ui(ui, o);
+            ui.add_space(14.0);
+        }
+        if let Some(err) = self.error.clone() {
+            egui::Frame::new().fill(ui::RED.gamma_multiply(0.1)).corner_radius(16).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    if ui.button("Accept").clicked() {
-                        self.e.decide(o.id, true);
-                    }
-                    if ui.button("Decline").clicked() {
-                        self.e.decide(o.id, false);
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui::round(ui, Icon::Close, "Dismiss", 30.0, Tone::Ground, true).clicked() {
+                            self.error = None;
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| ui.add(Label::new(ui::text(err, 13.0, W::Medium, ui::RED)).wrap()));
+                    });
                 });
             });
+            ui.add_space(12.0);
+        }
+        // While something is offered or moving and nothing is staged, the dock shrinks to one
+        // row and live transfers take its place above Devices.
+        let live = jobs.iter().any(Job::active);
+        self.dock_ui(ui, frame, hot, self.staged.is_empty() && !hot && (live || !offers.is_empty()));
+        ui.add_space(14.0);
+        if live {
+            self.activity_ui(ui, jobs);
+            ui.add_space(14.0);
+            self.devices_ui(ui, peers);
+        } else {
+            self.devices_ui(ui, peers);
+            ui.add_space(14.0);
+            self.activity_ui(ui, jobs);
         }
     }
 
-    fn staged_ui(&mut self, ui: &mut egui::Ui) {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let name = self.e.name.lock().unwrap().clone();
         ui.horizontal(|ui| {
-            ui.heading("To send");
-            if ui.button("Paste").on_hover_text("Ctrl+V / Cmd+V").clicked() {
-                self.paste();
-            }
-            if !self.staged.is_empty() && ui.button("Clear").clicked() {
-                self.staged.clear();
-            }
-        });
-        if self.staged.is_empty() {
-            ui.weak("Drop files or folders here, or press Ctrl+V.");
-        }
-        let mut remove = None;
-        for (i, item) in self.staged.iter().enumerate() {
-            ui.horizontal(|ui| {
-                if ui.small_button("x").on_hover_text("Remove").clicked() {
-                    remove = Some(i);
+            ui::avatar(ui, &name, 42.0, ui::INK, ui::LIME);
+            ui.add_space(2.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui::round(ui, Icon::Sliders, "Settings", 42.0, Tone::Ground, true).clicked() {
+                    self.settings = true;
                 }
-                ui.label(match item {
-                    Item::Path(p) if p.is_dir() => format!("{}/", file_name(p)),
-                    Item::Path(p) => file_name(p),
-                    Item::Open(_, name) => name.clone(),
-                    Item::Text(t) => format!("Text: {}", t.chars().take(50).collect::<String>().replace('\n', " ")),
+                if ui::round(ui, Icon::Folder, "Open received files", 42.0, Tone::Ground, true).clicked() {
+                    open(&self.e.dir.lock().unwrap());
+                }
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.add_space(3.0);
+                    ui.add(Label::new(ui::text(&name, 15.0, W::Semibold, ui::INK)).truncate());
+                    ui.add(Label::new(ui::text("Visible on this network", 12.5, W::Medium, ui::INK.gamma_multiply(0.72))).truncate());
                 });
             });
+        });
+    }
+
+    fn offer_ui(&mut self, ui: &mut egui::Ui, o: &Offer) {
+        let dest = tilde(&self.e.dir.lock().unwrap());
+        ui::ticket(
+            ui,
+            None,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui::badge(ui, Icon::Down, ui::LIME, ui::INK, 42.0);
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.add(Label::new(ui::text(&o.summary, 15.0, W::Medium, ui::INK)).wrap());
+                    });
+                });
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui::pill(ui, "Accept", Some(Icon::Check), Tone::Ink, true).clicked() {
+                            self.e.decide(o.id, true);
+                        }
+                        if ui::pill(ui, "Decline", None, Tone::Card, true).clicked() {
+                            self.e.decide(o.id, false);
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add(Label::new(ui::text("Saves to", 11.5, W::Regular, ui::MUTED)).truncate());
+                            ui.add(Label::new(ui::text(dest, 13.0, W::Medium, ui::INK)).truncate());
+                        });
+                    });
+                });
+            },
+        );
+    }
+
+    /// Files… / Folder… / Paste, as chosen by `add_buttons`.
+    fn add(&mut self, ctx: &egui::Context, frame: &eframe::Frame, which: Option<usize>) {
+        match which {
+            Some(0) => self.pick(ctx, frame, Pick::Files),
+            Some(1) => self.pick(ctx, frame, Pick::Folders),
+            Some(_) => self.paste(),
+            None => {}
         }
-        if let Some(i) = remove {
+    }
+
+    /// The cobalt sending block: a drop target when empty, the outgoing ticket when staged.
+    fn dock_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, hot: bool, compact: bool) {
+        ui::dock(hot).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if compact {
+                ui.horizontal(|ui| {
+                    if ui::round(ui, Icon::Plus, "Pick files", 38.0, Tone::Lime, true).clicked() {
+                        self.pick(ui.ctx(), frame, Pick::Files);
+                    }
+                    let which = add_buttons(ui, Tone::Glass, false);
+                    self.add(ui.ctx(), frame, which);
+                });
+                return;
+            }
+            if self.staged.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(14.0);
+                    if ui::round(ui, Icon::Plus, "Pick files", 56.0, Tone::Lime, true).clicked() {
+                        self.pick(ui.ctx(), frame, Pick::Files);
+                    }
+                    ui.add_space(12.0);
+                    ui.label(ui::text(if hot { "Release to add" } else { "Drop files or folders" }, 17.0, W::Semibold, ui::WHITE));
+                    ui.add_space(-4.0);
+                    ui.label(ui::text(format!("or paste anything with {PASTE_KEY}"), 13.0, W::Regular, ui::ON_COBALT_MUTED));
+                    ui.add_space(12.0);
+                });
+            } else {
+                self.ticket_ui(ui);
+                ui.add_space(12.0);
+            }
+            let which = add_buttons(ui, Tone::Glass, true);
+            self.add(ui.ctx(), frame, which);
+            ui.add_space(2.0);
+        });
+    }
+
+    fn ticket_ui(&mut self, ui: &mut egui::Ui) {
+        let (mut clear, mut remove) = (false, None);
+        let n = self.staged.len();
+        let total: u64 = self.staged.iter().filter_map(|s| s.size).sum();
+        let partial = self.staged.iter().any(|s| s.size.is_none());
+        let seed = self.staged.iter().fold(0xcbf29ce484222325u64, |h, s| s.name.bytes().fold(h, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
+        ui::ticket(
+            ui,
+            Some(ui::COBALT),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(ui::text("Outgoing", 19.0, W::Semibold, ui::INK));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui::round(ui, Icon::Close, "Clear all", 32.0, Tone::Card, true).clicked() {
+                            clear = true;
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                for (i, s) in self.staged.iter().enumerate().take(MAX_ROWS) {
+                    ui.horizontal(|ui| {
+                        let icon = match s.kind {
+                            Kind::File => Icon::File,
+                            Kind::Folder => Icon::Folder,
+                            Kind::Text => Icon::Text,
+                        };
+                        ui::glyph(ui, icon, 18.0, ui::MUTED, ui::WHITE);
+                        ui.add_space(2.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui::round(ui, Icon::Close, "Remove", 28.0, Tone::Ground, true).clicked() {
+                                remove = Some(i);
+                            }
+                            let size = match (&s.kind, s.size) {
+                                (Kind::Folder, _) => "Folder".into(),
+                                (_, Some(b)) => human(b),
+                                _ => String::new(),
+                            };
+                            ui.label(ui::text(size, 12.5, W::Regular, ui::MUTED));
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(Label::new(ui::text(&s.name, 14.0, W::Medium, ui::INK)).truncate());
+                            });
+                        });
+                    });
+                }
+                if n > MAX_ROWS {
+                    ui.label(ui::text(format!("+{} more", n - MAX_ROWS), 13.0, W::Medium, ui::MUTED));
+                }
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui::barcode(ui, seed, (ui.available_width() * 0.5).min(180.0));
+                        ui.label(ui::text(format!("{n} item{}", if n == 1 { "" } else { "s" }), 12.0, W::Medium, ui::MUTED));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(ui::text(if partial { "Total, plus folders" } else { "Total" }, 11.5, W::Regular, ui::MUTED));
+                            let size = if total > 0 { human(total) } else { "—".into() };
+                            ui.label(ui::text(size, 19.0, W::Semibold, ui::INK));
+                        });
+                    });
+                });
+            },
+        );
+        if clear {
+            self.staged.clear();
+        } else if let Some(i) = remove {
             self.staged.remove(i);
         }
     }
 
-    fn devices_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Devices");
-        let peers = self.e.peers();
-        if peers.is_empty() {
-            ui.weak("Looking for devices on this network…");
-        }
-        for p in peers {
-            let btn = egui::Button::new(format!("Send to {}", p.name)).min_size(egui::vec2(ui.available_width(), 32.0));
-            if ui.add_enabled(!self.staged.is_empty(), btn).on_hover_text(p.ip.to_string()).clicked() {
-                self.e.send(p.id, std::mem::take(&mut self.staged));
+    fn devices_ui(&mut self, ui: &mut egui::Ui, peers: &[Peer]) {
+        ui::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section(ui, "Devices", (!peers.is_empty()).then(|| peers.len().to_string()));
+            if peers.is_empty() {
+                ui.add(Label::new(ui::text("Nothing here yet. Open Akhri Pasta on another device on the same network and it appears within a few seconds.", 13.0, W::Regular, ui::MUTED)).wrap());
             }
-        }
-    }
-
-    fn jobs_ui(&mut self, ui: &mut egui::Ui) {
-        let jobs = self.e.jobs();
-        ui.horizontal(|ui| {
-            ui.heading("Transfers");
-            if ui.button("Open downloads").clicked() {
-                open(&self.e.dir.lock().unwrap());
-            }
-            if jobs.iter().any(|j| !j.active()) && ui.button("Clear finished").clicked() {
-                self.e.clear_finished();
+            let ready = !self.staged.is_empty();
+            for (i, p) in peers.iter().enumerate() {
+                if i > 0 {
+                    ui::hairline(ui);
+                }
+                ui.horizontal(|ui| {
+                    ui::avatar(ui, &p.name, 40.0, ui::RAISED, ui::INK);
+                    ui.add_space(2.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let tip = if ready { format!("Send to {}", p.name) } else { "Add files or text first".into() };
+                        if ui::round(ui, Icon::UpRight, &tip, 44.0, Tone::Lime, ready).clicked() {
+                            self.e.send(p.id, self.staged.drain(..).map(|s| s.item).collect());
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add_space(3.0);
+                            ui.add(Label::new(ui::text(&p.name, 14.5, W::Semibold, ui::INK)).truncate());
+                            ui.add(Label::new(ui::text(p.ip.to_string(), 12.5, W::Regular, ui::MUTED)).truncate());
+                        });
+                    });
+                });
             }
         });
-        for j in jobs {
+    }
+
+    fn activity_ui(&mut self, ui: &mut egui::Ui, jobs: &[Job]) {
+        ui::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(&j.label);
-                let status = j.status();
-                match j.t.state() {
-                    akhri_core::net::State::Running => {
-                        ui.add(egui::ProgressBar::new(j.fraction()).desired_width(200.0).text(status));
-                    }
-                    akhri_core::net::State::Failed(_) => {
-                        ui.colored_label(ui.visuals().error_fg_color, status);
-                    }
-                    _ => {
-                        ui.label(status);
-                    }
+                ui.label(ui::text("Activity", 15.5, W::Semibold, ui::INK));
+                if jobs.iter().any(|j| !j.active()) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui::link(ui, "Clear finished").clicked() {
+                            self.e.clear_finished();
+                        }
+                    });
                 }
-                if j.active() && ui.small_button("Cancel").clicked() {
+            });
+            ui.add_space(4.0);
+            if jobs.is_empty() {
+                ui.label(ui::text("Nothing sent or received yet.", 13.0, W::Regular, ui::MUTED));
+            }
+            for (i, j) in jobs.iter().enumerate() {
+                if i > 0 {
+                    ui::hairline(ui);
+                }
+                self.job_ui(ui, j);
+            }
+        });
+    }
+
+    fn job_ui(&self, ui: &mut egui::Ui, j: &Job) {
+        let state = j.t.state();
+        let arrow = if j.incoming { Icon::Down } else { Icon::Up };
+        let (icon, fg, bg) = match state {
+            State::Waiting => (arrow, ui::AMBER, egui::Color32::from_rgb(0xFC, 0xF0, 0xD6)),
+            State::Running => (arrow, ui::WHITE, ui::COBALT),
+            State::Done => (Icon::Check, ui::GREEN, egui::Color32::from_rgb(0xDD, 0xF5, 0xE8)),
+            State::Failed(_) => (Icon::Close, ui::RED, egui::Color32::from_rgb(0xFC, 0xE4, 0xE5)),
+        };
+        let failed = matches!(state, State::Failed(_));
+        ui.horizontal(|ui| {
+            ui::badge(ui, icon, fg, bg, 40.0);
+            ui.add_space(2.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if j.active() && ui::round(ui, Icon::Close, "Cancel", 32.0, Tone::Card, true).clicked() {
                     self.e.cancel(j.id);
                 }
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.add_space(3.0);
+                    ui.add(Label::new(ui::text(&j.label, 14.0, W::Semibold, ui::INK)).truncate());
+                    ui.add(Label::new(ui::text(j.status(), 12.5, W::Regular, if failed { ui::RED } else { ui::MUTED })).truncate());
+                });
+            });
+        });
+        if state == State::Running {
+            ui.horizontal(|ui| {
+                ui::numeral(ui, &format!("{}", (j.fraction() * 100.0).floor() as u32), "%");
+                ui.add_space(8.0);
+                ui::ticks(ui, j.fraction());
             });
         }
     }
 
-    fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Settings").show(ui, |ui| {
-            let mut changed = false;
+    fn settings_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        ui.horizontal(|ui| {
+            if ui::round(ui, Icon::Left, "Back (Esc)", 42.0, Tone::Ground, true).clicked() {
+                self.settings = false;
+            }
+            ui.add_space(4.0);
+            ui.label(ui::text("Settings", 24.0, W::Display, ui::INK));
+        });
+        ui.add_space(22.0);
+
+        let mut changed = false;
+        ui::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(ui::text("Device name", 13.0, W::Medium, ui::MUTED));
+            let mut name = self.e.name.lock().unwrap();
+            let edit = egui::TextEdit::singleline(&mut *name)
+                .font(ui::font(14.5, W::Medium))
+                .margin(egui::Margin::symmetric(12, 10))
+                .desired_width(f32::INFINITY);
+            changed |= ui.add(edit).changed();
+            drop(name);
+            ui.label(ui::text("Other devices see this name.", 12.5, W::Regular, ui::MUTED));
+        });
+        ui.add_space(12.0);
+        ui::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(ui::text("Received files", 13.0, W::Medium, ui::MUTED));
+            ui.add(Label::new(ui::text(tilde(&self.e.dir.lock().unwrap()), 14.5, W::Medium, ui::INK)).truncate());
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("Device name");
-                changed |= ui.text_edit_singleline(&mut *self.e.name.lock().unwrap()).changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label("Save to");
-                let mut d = self.e.dir.lock().unwrap().display().to_string();
-                if ui.text_edit_singleline(&mut d).changed() {
-                    *self.e.dir.lock().unwrap() = d.into();
-                    changed = true;
+                if ui::pill(ui, "Change…", Some(Icon::Folder), Tone::Ink, true).clicked() {
+                    self.pick(ui.ctx(), frame, Pick::SaveDir);
+                }
+                if ui::pill(ui, "Open", None, Tone::Card, true).clicked() {
+                    open(&self.e.dir.lock().unwrap());
                 }
             });
-            if changed {
-                save_config(&self.e.name.lock().unwrap(), &self.e.dir.lock().unwrap());
-            }
-            ui.weak(format!("Port {} (UDP + TCP) must be open in your firewall.", akhri_core::net::PORT));
         });
+        ui.add_space(12.0);
+        ui::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(ui::text("Network", 13.0, W::Medium, ui::MUTED));
+            ui.label(ui::text(format!("Port {}, UDP and TCP", akhri_core::net::PORT), 14.5, W::Medium, ui::INK));
+            ui.add(Label::new(ui::text("Allow both through your firewall so devices can find each other and connect.", 12.5, W::Regular, ui::MUTED)).wrap());
+        });
+        ui.add_space(16.0);
+        ui.label(ui::text(format!("{APP} {}", env!("CARGO_PKG_VERSION")), 12.0, W::Regular, ui::MUTED));
+        if changed {
+            self.persist();
+        }
     }
 }
 
-fn file_name(p: &std::path::Path) -> String {
+/// Files… / Folder… / Paste row; returns the index clicked.
+fn add_buttons(ui: &mut egui::Ui, tone: Tone, center: bool) -> Option<usize> {
+    let items = [("Files…", Icon::File), ("Folder…", Icon::Folder), ("Paste", Icon::Paste)];
+    let width = |icons: bool| items.iter().map(|(s, _)| ui::pill_width(ui, s, icons)).sum::<f32>() + 16.0;
+    // Narrow windows drop the icons rather than overflow the dock.
+    let icons = width(true) <= ui.available_width();
+    let total = width(icons);
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        if center {
+            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+        }
+        for (i, (s, icon)) in items.into_iter().enumerate() {
+            let r = ui::pill(ui, s, icons.then_some(icon), tone, true);
+            if r.clicked() {
+                clicked = Some(i);
+            }
+            if i == 2 {
+                r.on_hover_text(PASTE_KEY);
+            }
+        }
+    });
+    clicked
+}
+
+fn section(ui: &mut egui::Ui, title: &str, count: Option<String>) {
+    ui.horizontal(|ui| {
+        ui.label(ui::text(title, 15.5, W::Semibold, ui::INK));
+        if let Some(c) = count {
+            ui.label(ui::text(c, 15.5, W::Regular, ui::MUTED));
+        }
+    });
+    ui.add_space(4.0);
+}
+
+fn file_name(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// `/home/me/Downloads` -> `~/Downloads`
+fn tilde(p: &Path) -> String {
+    match p.strip_prefix(home()) {
+        Ok(rest) if !home().as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => p.display().to_string(),
+    }
 }
 
 fn save_png(w: u32, h: u32, rgba: &[u8]) -> std::io::Result<PathBuf> {
@@ -262,7 +698,7 @@ fn notify(msg: &str) {
     let _ = cmd.status();
 }
 
-fn open(p: &std::path::Path) {
+fn open(p: &Path) {
     let _ = fs::create_dir_all(p);
     let bin = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     if let Ok(mut c) = Command::new(bin).arg(p).spawn() {
@@ -284,7 +720,7 @@ fn load_config() -> (String, PathBuf) {
     (get("name=").unwrap_or_else(hostname), get("dir=").map_or_else(|| home().join("Downloads"), PathBuf::from))
 }
 
-fn save_config(name: &str, dir: &std::path::Path) {
+fn save_config(name: &str, dir: &Path) {
     let p = config_path();
     let _ = fs::create_dir_all(p.parent().unwrap());
     let _ = fs::write(p, format!("name={}\ndir={}\n", name.replace('\n', " "), dir.display()));
