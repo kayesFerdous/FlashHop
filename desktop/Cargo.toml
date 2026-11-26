@@ -1,10 +1,10 @@
 [package]
-name = "akhri_pasta"
-version = "0.2.0"
+name = "flashhop"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-akhri_core = { path = "../core" }
+flashhop_core = { path = "../core" }
 # glow (OpenGL) instead of wgpu: much smaller binary. Linux is forced onto X11/XWayland
 # in main.rs because winit has no Wayland drag-and-drop.
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "x11", "clipboard", "accesskit"] }

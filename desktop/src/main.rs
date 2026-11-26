@@ -1,8 +1,10 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")] // no console window
+
 mod ui;
 
-use akhri_core::{
+use flashhop_core::{
     Engine, Job, Offer, Peer, human,
-    net::{Item, State},
+    net::{Clip, Item, State},
 };
 use eframe::egui::{self, Align, Label, Layout};
 use std::{
@@ -15,11 +17,13 @@ use std::{
 };
 use ui::{Icon, Tone, W};
 
-const APP: &str = "Akhri Pasta";
+const APP: &str = "FlashHop";
 /// Content column width; wider windows center it.
 const MAX_W: f32 = 560.0;
 /// Staged rows shown before "+N more".
 const MAX_ROWS: usize = 6;
+/// The device search shows from this many devices on. Mirrored in MainActivity.
+const FIND_FROM: usize = 5;
 const PASTE_KEY: &str = if cfg!(target_os = "macos") { "Cmd+V" } else { "Ctrl+V" };
 
 enum Kind {
@@ -45,7 +49,7 @@ impl Staged {
                 let dir = md.as_ref().is_some_and(fs::Metadata::is_dir);
                 (file_name(p), if dir { Kind::Folder } else { Kind::File }, md.filter(|m| !m.is_dir()).map(|m| m.len()))
             }
-            Item::Open(_, n) => (n.clone(), Kind::File, None),
+            Item::Open(f, n) | Item::Image(f, n) => (n.clone(), Kind::File, f.metadata().ok().map(|m| m.len())),
             Item::Text(t) => (t.chars().take(80).collect::<String>().replace(['\n', '\r', '\t'], " "), Kind::Text, Some(t.len() as u64)),
         };
         Self { item: Some(item), name, kind, size }
@@ -72,17 +76,19 @@ struct App {
     ticket_rect: egui::Rect,
     /// The ticket just sent (when, where, its rows), drawn sliding out over the page.
     sent: Option<(f64, egui::Rect, Vec<Staged>)>,
+    /// Device search text.
+    find: String,
 }
 
 fn main() -> eframe::Result {
-    let (name, dir) = load_config();
-    // `akhri_pasta file1 folder2` stages them, so file-manager "Open with" works.
+    let (name, dir, recent) = load_config();
+    // `flashhop file1 folder2` stages them, so file-manager "Open with" works.
     let staged = std::env::args_os().skip(1).map(|a| Staged::new(Item::Path(a.into()))).collect();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 720.0])
             .with_min_inner_size([360.0, 520.0])
-            .with_app_id("akhri_pasta")
+            .with_app_id("flashhop")
             .with_icon(ui::app_icon(256)),
         // winit has no Wayland drag-and-drop; XWayland bridges drops from Wayland apps.
         #[cfg(target_os = "linux")]
@@ -97,6 +103,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             ui::setup(&cc.egui_ctx);
             let e = Engine::start(name, dir).map_err(|e| format!("Network error: {e} (is it already running?)"))?;
+            *e.recent.lock().unwrap() = recent;
             watch(e.clone(), cc.egui_ctx.clone());
             Ok(Box::new(App {
                 e,
@@ -108,6 +115,7 @@ fn main() -> eframe::Result {
                 settings: false,
                 ticket_rect: egui::Rect::NOTHING,
                 sent: None,
+                find: String::new(),
             }))
         }),
     )
@@ -140,9 +148,14 @@ impl eframe::App for App {
             *self.e.dir.lock().unwrap() = d;
             self.persist();
         }
-        for text in self.e.take_texts() {
-            if let Some(c) = &mut self.clip {
-                let _ = c.set_text(text);
+        for clip in self.e.take_clips() {
+            let Some(c) = &mut self.clip else { break };
+            match clip {
+                Clip::Text(t) => drop(c.set_text(t)),
+                Clip::Image(p) => match read_png(&p) {
+                    Ok((width, height, rgba)) => drop(c.set_image(arboard::ImageData { width, height, bytes: rgba.into() })),
+                    Err(e) => eprintln!("clipboard image {}: {e}", p.display()),
+                },
             }
         }
         let (peers, offers, jobs) = (self.e.peers(), self.e.offers(), self.e.jobs());
@@ -313,8 +326,9 @@ impl App {
         {
             self.staged.push(Staged::new(Item::Text(text)));
         } else if let Ok(img) = c.get_image() {
+            // Sent as a clipboard image, so it lands on the other device's clipboard too.
             match save_png(img.width as u32, img.height as u32, &img.bytes) {
-                Ok(p) => self.staged.push(Staged::new(Item::Path(p))),
+                Ok((name, f)) => self.staged.push(Staged::new(Item::Image(f, name))),
                 Err(e) => self.error = Some(format!("Could not save pasted image: {e}")),
             }
         }
@@ -347,13 +361,20 @@ impl App {
     }
 
     fn persist(&self) {
-        save_config(&self.e.name.lock().unwrap(), &self.e.dir.lock().unwrap());
+        save_config(&self.e.name.lock().unwrap(), &self.e.dir.lock().unwrap(), &self.e.recent.lock().unwrap());
+    }
+
+    fn send_to(&mut self, peer: u64, now: f64) {
+        self.e.send(peer, self.staged.iter_mut().filter_map(|s| s.item.take()).collect());
+        self.sent = Some((now, self.ticket_rect, std::mem::take(&mut self.staged)));
+        self.find.clear();
+        self.persist(); // the receiver is now a recent device
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, peers: &[Peer], offers: &[Offer], jobs: &[Job], hot: bool) {
         self.top_bar(ui);
         ui.add_space(28.0);
-        let (strong, rest) = akhri_core::headline(peers.len(), self.staged.len(), false);
+        let (strong, rest) = flashhop_core::headline(peers.len(), self.staged.len(), false);
         ui::headline(ui, &strong, rest);
         ui.add_space(20.0);
         for o in offers {
@@ -430,6 +451,7 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui::pill(ui, "Accept", Some(Icon::Check), Tone::Ink, true).clicked() {
                             self.e.decide(o.id, true);
+                            self.persist(); // the sender is now a recent device
                         }
                         if ui::pill(ui, "Decline", None, Tone::Card, true).clicked() {
                             self.e.decide(o.id, false);
@@ -502,10 +524,29 @@ impl App {
             ui.set_width(ui.available_width());
             section(ui, "Devices", (!peers.is_empty()).then(|| peers.len().to_string()));
             if peers.is_empty() {
-                ui.add(Label::new(ui::text("Nothing here yet. Open Akhri Pasta on another device on the same network and it appears within a few seconds.", 13.0, W::Regular, ui::MUTED)).wrap());
+                ui.add(Label::new(ui::text("Nothing here yet. Open FlashHop on another device on the same network and it appears within a few seconds.", 13.0, W::Regular, ui::MUTED)).wrap());
             }
             let ready = !self.staged.is_empty();
-            for (i, p) in peers.iter().enumerate() {
+            let mut enter = false;
+            if peers.len() >= FIND_FROM || !self.find.is_empty() {
+                let edit = egui::TextEdit::singleline(&mut self.find)
+                    .hint_text(ui::text("Find a device", 14.5, W::Medium, ui::MUTED))
+                    .font(ui::font(14.5, W::Medium))
+                    .margin(egui::Margin::symmetric(12, 10))
+                    .desired_width(f32::INFINITY);
+                enter = ui.add(edit).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.add_space(6.0);
+            }
+            // Name (any case) or address. Mirrored in MainActivity.renderDevices.
+            let q = self.find.trim().to_lowercase();
+            let shown: Vec<&Peer> = peers.iter().filter(|p| p.name.to_lowercase().contains(&q) || p.ip.to_string().contains(&q)).collect();
+            if !peers.is_empty() && shown.is_empty() {
+                ui.label(ui::text("No device matches.", 13.0, W::Regular, ui::MUTED));
+            }
+            if enter && ready && shown.len() == 1 {
+                self.send_to(shown[0].id, ui.input(|i| i.time));
+            }
+            for (i, p) in shown.into_iter().enumerate() {
                 if i > 0 {
                     ui::hairline(ui);
                 }
@@ -515,14 +556,13 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let tip = if ready { format!("Send to {}", p.name) } else { "Add files or text first".into() };
                         if ui::round(ui, Icon::UpRight, &tip, 44.0, Tone::Lime, ready).clicked() {
-                            self.e.send(p.id, self.staged.iter_mut().filter_map(|s| s.item.take()).collect());
-                            self.sent = Some((ui.input(|i| i.time), self.ticket_rect, std::mem::take(&mut self.staged)));
+                            self.send_to(p.id, ui.input(|i| i.time));
                         }
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add_space(3.0);
                             ui.add(Label::new(ui::text(&p.name, 14.5, W::Semibold, ui::INK)).truncate());
-                            ui.add(Label::new(ui::text(p.ip.to_string(), 12.5, W::Regular, ui::MUTED)).truncate());
+                            ui.add(Label::new(ui::text(p.detail(), 12.5, W::Regular, ui::MUTED)).truncate());
                         });
                     });
                 });
@@ -632,7 +672,7 @@ impl App {
         ui::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(ui::text("Network", 13.0, W::Medium, ui::MUTED));
-            ui.label(ui::text(format!("Port {}, UDP and TCP", akhri_core::net::PORT), 14.5, W::Medium, ui::INK));
+            ui.label(ui::text(format!("Port {}, UDP and TCP", flashhop_core::net::PORT), 14.5, W::Medium, ui::INK));
             ui.add(Label::new(ui::text("Allow both through your firewall so devices can find each other and connect.", 12.5, W::Regular, ui::MUTED)).wrap());
         });
         ui.add_space(16.0);
@@ -690,11 +730,31 @@ fn tilde(p: &Path) -> String {
     }
 }
 
-fn save_png(w: u32, h: u32, rgba: &[u8]) -> std::io::Result<PathBuf> {
+/// Encodes a clipboard image to an open, already-unlinked temp PNG (no leftovers), plus its name.
+fn save_png(w: u32, h: u32, rgba: &[u8]) -> std::io::Result<(String, fs::File)> {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let path = std::env::temp_dir().join(format!("clipboard-{secs}.png"));
+    let name = format!("clipboard-{secs}.png");
+    let path = std::env::temp_dir().join(&name);
     write_png(&path, w, h, rgba)?;
-    Ok(path)
+    let f = fs::File::open(&path)?;
+    let _ = fs::remove_file(&path);
+    Ok((name, f))
+}
+
+/// A received clipboard image as (width, height, RGBA8) for arboard.
+fn read_png(path: &Path) -> std::io::Result<(usize, usize, Vec<u8>)> {
+    let mut d = png::Decoder::new(std::io::BufReader::new(fs::File::open(path)?));
+    d.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
+    let mut r = d.read_info().map_err(std::io::Error::other)?;
+    let mut buf = vec![0; r.output_buffer_size().ok_or_else(|| std::io::Error::other("image too large"))?];
+    let info = r.next_frame(&mut buf).map_err(std::io::Error::other)?;
+    buf.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::GrayscaleAlpha => buf.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
+        c => return Err(std::io::Error::other(format!("unexpected PNG color type {c:?}"))),
+    };
+    Ok((info.width as usize, info.height as usize, rgba))
 }
 
 fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
@@ -711,46 +771,71 @@ fn notify(msg: &str) {
     #[cfg(target_os = "macos")]
     let mut cmd = Command::new("osascript");
     #[cfg(target_os = "macos")]
-    cmd.args(["-e", "on run argv", "-e", "display notification (item 1 of argv) with title \"Akhri Pasta\"", "-e", "end run", msg]);
-    #[cfg(not(target_os = "macos"))]
+    cmd.args(["-e", "on run argv", "-e", "display notification (item 1 of argv) with title \"FlashHop\"", "-e", "end run", msg]);
+    #[cfg(windows)]
+    let mut cmd = Command::new("powershell");
+    // Toast through Windows PowerShell's own app id; the message arrives in an env var, not the script.
+    #[cfg(windows)]
+    cmd.env("FLASHHOP_MSG", msg).args(["-NoProfile", "-NonInteractive", "-Command", WIN_TOAST]);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // CREATE_NO_WINDOW
+    #[cfg(not(any(target_os = "macos", windows)))]
     let mut cmd = Command::new("notify-send");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     cmd.args(["-a", APP, "--", APP, msg]);
     let _ = cmd.status();
 }
 
+#[cfg(windows)]
+const WIN_TOAST: &str = r#"$N=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]
+$x=$N::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t=$x.GetElementsByTagName('text')
+[void]$t[0].AppendChild($x.CreateTextNode('FlashHop'))
+[void]$t[1].AppendChild($x.CreateTextNode($env:FLASHHOP_MSG))
+$N::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))"#;
+
 fn open(p: &Path) {
     let _ = fs::create_dir_all(p);
-    let bin = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let bin = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
     if let Ok(mut c) = Command::new(bin).arg(p).spawn() {
         thread::spawn(move || c.wait());
     }
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default()
 }
 
 fn config_path() -> PathBuf {
-    home().join(".config/akhri_pasta/config")
+    home().join(".config/flashhop/config")
 }
 
-fn load_config() -> (String, PathBuf) {
-    let txt = fs::read_to_string(config_path()).unwrap_or_default();
+/// (name, save dir, recent device names). One `recent=` line per name, newest first.
+fn load_config() -> (String, PathBuf, Vec<String>) {
+    // Falls back to the config from before the rename to FlashHop; the next save writes the new path.
+    let old = || fs::read_to_string(home().join(".config/akhri_pasta/config"));
+    let txt = fs::read_to_string(config_path()).or_else(|_| old()).unwrap_or_default();
     let get = |k: &str| txt.lines().find_map(|l| l.strip_prefix(k)).map(str::to_string);
-    (get("name=").unwrap_or_else(hostname), get("dir=").map_or_else(|| home().join("Downloads"), PathBuf::from))
+    let recent = txt.lines().filter_map(|l| l.strip_prefix("recent=")).map(str::to_string).collect();
+    (get("name=").unwrap_or_else(hostname), get("dir=").map_or_else(|| home().join("Downloads"), PathBuf::from), recent)
 }
 
-fn save_config(name: &str, dir: &Path) {
+fn save_config(name: &str, dir: &Path, recent: &[String]) {
     let p = config_path();
     let _ = fs::create_dir_all(p.parent().unwrap());
-    let _ = fs::write(p, format!("name={}\ndir={}\n", name.replace('\n', " "), dir.display()));
+    let mut txt = format!("name={}\ndir={}\n", name.replace('\n', " "), dir.display());
+    for r in recent {
+        txt += &format!("recent={}\n", r.replace('\n', " "));
+    }
+    let _ = fs::write(p, txt);
 }
 
 fn hostname() -> String {
     #[cfg(target_os = "macos")]
     let raw = Command::new("scutil").args(["--get", "ComputerName"]).output().map(|o| o.stdout).unwrap_or_default();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let raw = std::env::var("COMPUTERNAME").unwrap_or_default().into_bytes();
+    #[cfg(not(any(target_os = "macos", windows)))]
     let raw = fs::read("/proc/sys/kernel/hostname").unwrap_or_default();
     let s = String::from_utf8_lossy(&raw).trim().to_string();
     if s.is_empty() { "My device".into() } else { s }
@@ -768,6 +853,35 @@ mod tests {
         if let Some(p) = std::env::var_os("ICON_PNG") {
             super::write_png(p.as_ref(), 1024, 1024, &i.rgba).unwrap();
         }
+        // ICON_ICO=<path>: one 256 px PNG in an .ico container, for the Windows Start menu shortcut.
+        if let Some(p) = std::env::var_os("ICON_ICO") {
+            let tmp = std::env::temp_dir().join(format!("flashhop-ico-{}.png", std::process::id()));
+            super::write_png(&tmp, 256, 256, &super::ui::app_icon(256).rgba).unwrap();
+            let png = std::fs::read(&tmp).unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            // header (reserved, type 1, 1 image) + entry (0 = 256 px, 1 plane, 32 bpp, size, offset 22)
+            let mut ico = vec![0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 32, 0];
+            ico.extend((png.len() as u32).to_le_bytes());
+            ico.extend(22u32.to_le_bytes());
+            ico.extend(png);
+            std::fs::write(p, ico).unwrap();
+        }
+    }
+
+    #[test]
+    fn clipboard_png_round_trip() {
+        let rgba: Vec<u8> = (0..4 * 3 * 2).map(|i| i as u8 * 9).collect();
+        let (name, mut f) = super::save_png(3, 2, &rgba).unwrap();
+        assert!(name.starts_with("clipboard-") && !std::env::temp_dir().join(&name).exists(), "temp file is unlinked");
+        let path = std::env::temp_dir().join(format!("flashhop-png-{}.png", std::process::id()));
+        std::io::copy(&mut f, &mut std::fs::File::create(&path).unwrap()).unwrap();
+        assert_eq!(super::read_png(&path).unwrap(), (3, 2, rgba));
+        // Phones may send grayscale PNGs; they come out as RGBA too.
+        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 2, 1);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.write_header().unwrap().write_image_data(&[10, 200]).unwrap();
+        assert_eq!(super::read_png(&path).unwrap(), (2, 1, vec![10, 10, 10, 255, 200, 200, 200, 255]));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -776,7 +890,7 @@ mod tests {
         let ctx = egui::Context::default();
         super::ui::setup(&ctx);
         let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0))), ..Default::default() };
-        let path = "~/some/very/long/folder/that/ends/in/AkhriPasta";
+        let path = "~/some/very/long/folder/that/ends/in/FlashHop";
         let mut shown = String::new();
         for _ in 0..2 {
             // fonts load on the first frame
@@ -786,6 +900,6 @@ mod tests {
             shown = out.shapes.iter().find_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.text().to_owned()) } else { None }).unwrap();
             out.drop_without_applying_deltas();
         }
-        assert!(shown.starts_with('…') && shown.ends_with("/AkhriPasta"), "{shown}");
+        assert!(shown.starts_with('…') && shown.ends_with("/FlashHop"), "{shown}");
     }
 }

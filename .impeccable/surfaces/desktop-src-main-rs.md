@@ -2,12 +2,12 @@
 version: 1
 slug: "desktop-src-main-rs"
 primary_target: "desktop/src/main.rs"
-related_targets: ["android/src/app/akhripasta/MainActivity.kt"]
+related_targets: ["android/src/app/flashhop/MainActivity.kt"]
 ---
 
 # Main screen (desktop window + Android activity)
 
-Scope: the single working screen of Akhri Pasta on desktop (egui) and Android (platform views), plus its settings view. Mode: Operate.
+Scope: the single working screen of FlashHop on desktop (egui) and Android (platform views), plus its settings view. Mode: Operate.
 
 Audience and job: tech-savvy users moving files, folders, screenshots and text between their own devices on one router. Stage → pick device → other side accepts. States: searching, devices found, staged, incoming offer, waiting, running, done, failed.
 

@@ -1,4 +1,4 @@
-package app.akhripasta
+package app.flashhop
 
 import android.content.Context
 import android.content.res.ColorStateList
@@ -14,10 +14,13 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.InsetDrawable
 import android.graphics.drawable.RippleDrawable
+import android.text.Editable
 import android.text.TextUtils
+import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -52,7 +55,7 @@ enum class Tone(val fill: Int, val fg: Int, val ripple: Int) {
     Lime(C.LIME, C.INK, 0x220E0F14),
 }
 
-enum class Ic { Plus, Close, Check, Up, Down, UpRight, Folder, File, Text, Paste, Sliders }
+enum class Ic { Plus, Close, Check, Up, Down, UpRight, Left, Folder, File, Text, Paste, Sliders }
 
 fun Context.dp(v: Float) = v * resources.displayMetrics.density
 fun Context.dp(v: Int) = dp(v.toFloat()).toInt()
@@ -151,6 +154,26 @@ fun Context.avatar(name: String, sizeDp: Int, bg: Int, fg: Int) = tv(initial(nam
     setTextSize(TypedValue.COMPLEX_UNIT_DIP, sizeDp * 0.42f) // fixed: it's a glyph in a fixed circle
 }
 
+/** Single-line text field on a raised surface (device name, device search). */
+fun Context.field(hint: String) = EditText(this).apply {
+    isSingleLine = true
+    this.hint = hint
+    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+    typeface = face(500)
+    setTextColor(C.INK)
+    setHintTextColor(C.MUTED)
+    highlightColor = C.PERFORATION
+    background = rounded(C.RAISED, 14f)
+    setPadding(dp(14), dp(12), dp(14), dp(12))
+    layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+}
+
+fun EditText.onChange(f: (String) -> Unit) = addTextChangedListener(object : TextWatcher {
+    override fun afterTextChanged(s: Editable) = f(s.toString())
+    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+})
+
 fun initial(name: String) = name.firstOrNull { it.isLetterOrDigit() }?.uppercase() ?: "?"
 
 fun Context.hairline() = View(this).apply {
@@ -189,6 +212,7 @@ class IconDrawable(private val icon: Ic, color: Int, private val bg: Int) : Draw
             Ic.Up -> { line(12f, 19f, 12f, 5f); line(6f, 11f, 12f, 5f, 18f, 11f) }
             Ic.Down -> { line(12f, 5f, 12f, 19f); line(6f, 13f, 12f, 19f, 18f, 13f) }
             Ic.UpRight -> { line(7f, 17f, 17f, 7f); line(8f, 7f, 17f, 7f, 17f, 16f) }
+            Ic.Left -> { line(19f, 12f, 5f, 12f); line(11f, 6f, 5f, 12f, 11f, 18f) }
             Ic.Folder -> closed(3f, 6f, 9.5f, 6f, 11.5f, 8.5f, 21f, 8.5f, 21f, 19f, 3f, 19f)
             Ic.File -> { closed(6f, 3f, 14f, 3f, 19f, 8f, 19f, 21f, 6f, 21f); line(14f, 3f, 14f, 8f, 19f, 8f) }
             Ic.Text -> { line(5f, 7f, 19f, 7f); line(5f, 12f, 19f, 12f); line(5f, 17f, 13f, 17f) }

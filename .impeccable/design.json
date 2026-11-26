@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedAt": "2026-11-25T22:20:00Z",
-  "title": "Design System: Akhri Pasta",
+  "title": "Design System: FlashHop",
   "extensions": {
     "colorMeta": {
       "ground-lavender": { "role": "neutral", "displayName": "Ground Lavender", "canonical": "#E9EBF5" },

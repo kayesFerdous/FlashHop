@@ -1,8 +1,7 @@
-package app.akhripasta
+package app.flashhop
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.app.DownloadManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -13,6 +12,8 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.ImageDecoder
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -21,17 +22,20 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.AbsoluteSizeSpan
 import android.text.style.ForegroundColorSpan
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.AccelerateInterpolator
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.EditText
@@ -40,11 +44,14 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import java.io.File
 import kotlin.concurrent.thread
 
-/** A file (content uri) or text waiting to be sent. */
-class Staged(val uri: Uri?, val text: String?, val label: String, val size: Long?)
+/** A file (content uri) or text waiting to be sent. [image]: pasted from the clipboard, so it lands
+ *  on the other device's clipboard too. */
+class Staged(val uri: Uri?, val text: String?, val label: String, val size: Long?, val image: Boolean = false)
 
 class MainActivity : Activity() {
     private val staged = ArrayList<Staged>()
@@ -59,15 +66,26 @@ class MainActivity : Activity() {
     private lateinit var devicesCard: LinearLayout
     private lateinit var activityCard: LinearLayout
     private lateinit var col: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var findInput: EditText
+    private lateinit var devicesHead: LinearLayout
+    private lateinit var devicesRows: LinearLayout
+    /** Where received files go: a plain path under Download/ or Documents/. */
+    private lateinit var dir: File
+    /** The settings page while it replaces the main column. */
+    private var settings: View? = null
+    private var dirView: TextView? = null
+    private var backCallback: Any? = null // OnBackInvokedCallback on Android 13+
     private var multicast: WifiManager.MulticastLock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = getSharedPreferences("akhri", MODE_PRIVATE)
+        prefs = getSharedPreferences("flashhop", MODE_PRIVATE)
         val name = prefs.getString("name", null)
             ?: Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) ?: Build.MODEL
         @Suppress("DEPRECATION")
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AkhriPasta")
+        dir = prefs.getString("dir", null)?.let(::File)
+            ?: File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FlashHop")
 
         // Soft cobalt wash from the top-left; brighter while something is offered or moving.
         glow = View(this).apply {
@@ -85,8 +103,8 @@ class MainActivity : Activity() {
         val top = row(
             avatarView,
             column(nameView, tv("Visible on this network", 13f, 500, 0xFF3D4152.toInt()).margins(t = dp(3))).weight1().margins(l = dp(12)),
-            round(Ic.Folder, "Received files", 48, Tone.Ground) { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) },
-            round(Ic.Sliders, "Settings", 48, Tone.Ground) { rename(dir) }.margins(l = dp(8)),
+            round(Ic.Folder, "Received files", 48, Tone.Ground) { openDir() },
+            round(Ic.Sliders, "Settings", 48, Tone.Ground) { openSettings() }.margins(l = dp(8)),
         )
         headline = tv("", 30f, 650, C.INK, lines = 0).apply { letterSpacing = -0.02f; setLineSpacing(0f, 1.08f) }
         errorView = tv("", 14f, 500, C.RED, lines = 0).apply {
@@ -94,14 +112,26 @@ class MainActivity : Activity() {
         }
         offersBox = column()
         dockBox = column().apply { background = rounded(C.COBALT, 28f); setPadding(dp(14), dp(14), dp(14), dp(14)) }
-        devicesCard = card()
+        findInput = field("Find a device").apply {
+            imeOptions = EditorInfo.IME_ACTION_GO
+            onChange { render() }
+            // Go with exactly one match sends to it, like Enter on desktop.
+            setOnEditorActionListener { _, _, _ ->
+                val m = matching(snap.peers)
+                if (staged.isNotEmpty() && m.size == 1) send(m[0]) else hideKeyboard()
+                true
+            }
+        }
+        devicesHead = column()
+        devicesRows = column()
+        devicesCard = card().apply { addView(devicesHead); addView(findInput.margins(b = dp(10))); addView(devicesRows) }
         activityCard = card()
 
         col = column(
             top, headline.margins(t = dp(28)), errorView.margins(t = dp(16)), offersBox.margins(t = dp(20)),
             dockBox, devicesCard.margins(t = dp(14)), activityCard.margins(t = dp(14)),
         ).apply { setPadding(dp(20), dp(12), dp(20), dp(28)) }
-        val scroll = ScrollView(this).apply { addView(col); isVerticalScrollBarEnabled = false }
+        scroll = ScrollView(this).apply { addView(col); isVerticalScrollBarEnabled = false }
         val root = FrameLayout(this).apply {
             setBackgroundColor(C.BG)
             addView(glow, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(520)))
@@ -118,7 +148,7 @@ class MainActivity : Activity() {
         window.insetsController?.setSystemBarsAppearance(light, light)
         window.isNavigationBarContrastEnforced = false
 
-        Core.start(name, dir.path)?.let { errorView.text = it; errorView.visibility = View.VISIBLE }
+        Core.start(name, dir.path, prefs.getString("recent", "")!!)?.let { errorView.text = it; errorView.visibility = View.VISIBLE }
         startWatcher(applicationContext)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
@@ -135,7 +165,7 @@ class MainActivity : Activity() {
         super.onStart()
         // Broadcast discovery only needs to listen while the app is visible; saves battery.
         multicast = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager)
-            .createMulticastLock("akhri").apply { setReferenceCounted(false); acquire() }
+            .createMulticastLock("flashhop").apply { setReferenceCounted(false); acquire() }
     }
 
     override fun onStop() {
@@ -184,7 +214,9 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != PICK || resultCode != RESULT_OK || data == null) return
+        if (resultCode != RESULT_OK || data == null) return
+        if (requestCode == PICK_DIR) { data.data?.let { setDir(it) }; return }
+        if (requestCode != PICK) return
         val clip = data.clipData
         if (clip != null) for (i in 0 until clip.itemCount) stageUri(clip.getItemAt(i).uri) else data.data?.let { stageUri(it) }
         render()
@@ -195,12 +227,14 @@ class MainActivity : Activity() {
         if (clip == null || clip.itemCount == 0) return toast("Clipboard is empty")
         for (i in 0 until clip.itemCount) {
             val item = clip.getItemAt(i)
-            if (item.uri != null) stageUri(item.uri) else stageText(item.coerceToText(this).toString())
+            val uri = item.uri
+            if (uri == null) stageText(item.coerceToText(this).toString())
+            else stageUri(uri, image = contentResolver.getType(uri)?.startsWith("image/") ?: clip.description.hasMimeType("image/*"))
         }
         render()
     }
 
-    private fun stageUri(uri: Uri) {
+    private fun stageUri(uri: Uri, image: Boolean = false) {
         var name: String? = null
         var size: Long? = null
         runCatching {
@@ -208,7 +242,23 @@ class MainActivity : Activity() {
                 if (c.moveToFirst()) { name = c.getString(0); if (!c.isNull(1)) size = c.getLong(1) }
             }
         }
-        staged += Staged(uri, null, name ?: uri.lastPathSegment ?: "file", size)
+        staged += Staged(uri, null, name ?: uri.lastPathSegment ?: "file", size, image)
+    }
+
+    /** A clipboard image as a PNG fd: as-is if it already is one, else re-encoded through an
+     *  unlinked cache file, so every receiver can put it on its clipboard. */
+    private fun pngFd(uri: Uri): Int {
+        if (contentResolver.getType(uri) == "image/png") return contentResolver.openFileDescriptor(uri, "r")!!.detachFd()
+        val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { d, _, _ ->
+            d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+        val f = File.createTempFile("clip", ".png", cacheDir)
+        try {
+            f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY).detachFd()
+        } finally {
+            f.delete()
+        }
     }
 
     private fun stageText(t: String) {
@@ -219,13 +269,17 @@ class MainActivity : Activity() {
         val fds = ArrayList<Int>()
         val names = ArrayList<String>()
         val texts = ArrayList<String>()
-        for (s in staged) {
+        var images = 0
+        // Clipboard images go first: Core.send treats the first `images` fds as clipboard images.
+        for (s in staged.sortedByDescending { it.image }) {
             if (s.text != null) { texts += s.text; continue }
+            val png = if (s.image) runCatching { pngFd(s.uri!!) }.getOrNull() else null
+            if (png != null) { fds += png; names += s.label.substringBeforeLast('.') + ".png"; images++; continue }
             val fd = runCatching { contentResolver.openFileDescriptor(s.uri!!, "r")!!.detachFd() }
             fd.onSuccess { fds += it; names += s.label }.onFailure { toast("Skipped ${s.label}: ${it.message}") }
         }
         if (fds.isEmpty() && texts.isEmpty()) return
-        Core.send(peer.id, fds.toIntArray(), names.toTypedArray(), texts.toTypedArray())
+        Core.send(peer.id, fds.toIntArray(), names.toTypedArray(), texts.toTypedArray(), images)
         // The ticket slides out over the page (ease-in, fading) while the dock re-renders under it.
         // Mirrored in desktop App::ui.
         (dockBox.getChildAt(0) as? Ticket)?.let { t ->
@@ -235,30 +289,111 @@ class MainActivity : Activity() {
                 .setInterpolator(AccelerateInterpolator()).withEndAction { host.overlay.remove(t) }.start()
         }
         staged.clear()
+        saveRecent()
+        hideKeyboard()
+        findInput.text.clear()
         render()
     }
 
-    private fun rename(dir: File) {
-        val input = EditText(this).apply {
-            setText(nameView.text); setSelection(text.length); isSingleLine = true
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+    private fun saveRecent() = prefs.edit().putString("recent", Core.recent()).apply()
+
+    private fun hideKeyboard() = getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(scroll.windowToken, 0)
+
+    // ---------- settings ----------
+
+    /** Settings replace the main column, as on desktop: device name and where received files go. */
+    private fun openSettings() {
+        if (settings != null) return
+        val nameField = field("Device name").apply { setText(nameView.text); onChange { rename(it) } }
+        dirView = tv(shortDir(), 16f, 500, C.INK, lines = 0)
+        val version = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull().orEmpty()
+        val page = column(
+            row(round(Ic.Left, "Back", 48, Tone.Ground) { closeSettings() }, tv("Settings", 26f, 650, C.INK).margins(l = dp(12))),
+            card().apply {
+                addView(tv("Device name", 13f, 500, C.MUTED))
+                addView(nameField.margins(t = dp(8)))
+                addView(tv("Other devices see this name.", 13f, 400, C.MUTED).margins(t = dp(8)))
+            }.margins(t = dp(24)),
+            card().apply {
+                addView(tv("Received files", 13f, 500, C.MUTED))
+                addView(dirView!!.margins(t = dp(4)))
+                addView(row(
+                    pill("Change…", Ic.Folder, Tone.Ink) { pickDir() },
+                    pill("Open", null, Tone.Card) { openDir() }.margins(l = dp(8)),
+                ).margins(t = dp(12)))
+                addView(tv("Any folder inside Download or Documents.", 13f, 400, C.MUTED).margins(t = dp(10)))
+            }.margins(t = dp(12)),
+            tv("FlashHop $version", 12f, 400, C.MUTED).margins(l = dp(4), t = dp(16)),
+        ).apply { setPadding(dp(20), dp(12), dp(20), dp(28)) }
+        settings = page
+        scroll.removeAllViews()
+        scroll.addView(page)
+        if (Build.VERSION.SDK_INT >= 33) {
+            val cb = OnBackInvokedCallback { closeSettings() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+            backCallback = cb
         }
-        val box = FrameLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(input) }
-        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Light_Dialog_Alert)
-            .setTitle("Device name")
-            .setMessage("Other devices see this name. Received files are saved to Download/${dir.name}.")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ ->
-                val n = input.text.toString().trim()
-                if (n.isNotEmpty()) {
-                    prefs.edit().putString("name", n).apply()
-                    Core.setName(n)
-                    nameView.text = n
-                    avatarView.text = initial(n)
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
+    }
+
+    private fun closeSettings() {
+        if (settings == null) return
+        hideKeyboard()
+        if (Build.VERSION.SDK_INT >= 33) (backCallback as? OnBackInvokedCallback)?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+        backCallback = null
+        settings = null
+        dirView = null
+        scroll.removeAllViews()
+        scroll.addView(col)
+        render()
+    }
+
+    @Deprecated("Back on Android 11 and 12; 13+ uses the OnBackInvokedCallback in openSettings()")
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (settings != null) closeSettings() else super.onBackPressed()
+    }
+
+    private fun rename(raw: String) {
+        val n = raw.trim()
+        if (n.isEmpty()) return
+        prefs.edit().putString("name", n).apply()
+        Core.setName(n)
+        nameView.text = n
+        avatarView.text = initial(n)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun shortDir() = dir.path.removePrefix(Environment.getExternalStorageDirectory().path + "/")
+
+    private fun dirUri() = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:" + shortDir())
+
+    private fun pickDir() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).putExtra(DocumentsContract.EXTRA_INITIAL_URI, dirUri())
+        @Suppress("DEPRECATION")
+        startActivityForResult(i, PICK_DIR)
+    }
+
+    /** The engine saves by plain path. Android 11+ lets apps write any file type by path only under
+     *  Download/ and Documents/ on internal storage, so only folders there are accepted. */
+    @Suppress("DEPRECATION")
+    private fun setDir(tree: Uri) {
+        val id = DocumentsContract.getTreeDocumentId(tree)
+        val rel = id.substringAfter(':', "")
+        if (!id.startsWith("primary:") || rel.substringBefore('/') !in setOf("Download", "Documents")) {
+            return toast("Pick a folder inside Download or Documents")
+        }
+        dir = File(Environment.getExternalStorageDirectory(), rel)
+        prefs.edit().putString("dir", dir.path).apply()
+        Core.start(nameView.text.toString(), dir.path, "") // running engine: just switches the folder
+        dirView?.text = shortDir()
+        render()
+    }
+
+    /** Opens the folder in the Files app; falls back to the Downloads list. */
+    private fun openDir() {
+        dir.mkdirs()
+        val view = Intent(Intent.ACTION_VIEW).setDataAndType(dirUri(), DocumentsContract.Document.MIME_TYPE_DIR)
+        runCatching { startActivity(view) }.onFailure { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
     }
 
     // ---------- rendering ----------
@@ -302,9 +437,9 @@ class MainActivity : Activity() {
     private fun offerTicket(o: Offer) = Ticket(this).apply {
         top.addView(row(badge(Ic.Down, C.LIME, C.INK, 44), tv(o.summary, 16f, 500, C.INK, lines = 0).weight1().margins(l = dp(12))))
         stub.addView(row(
-            column(tv("Saves to", 12f, 400, C.MUTED), tv("Download/AkhriPasta", 14f, 500, C.INK).margins(t = dp(3))).weight1(),
+            column(tv("Saves to", 12f, 400, C.MUTED), tv(shortDir(), 14f, 500, C.INK).margins(t = dp(3))).weight1(),
             pill("Decline", null, Tone.Card) { Core.decide(o.id, false) },
-            pill("Accept", Ic.Check, Tone.Ink) { Core.decide(o.id, true) }.margins(l = dp(8)),
+            pill("Accept", Ic.Check, Tone.Ink) { Core.decide(o.id, true); saveRecent() }.margins(l = dp(8)),
         ))
     }
 
@@ -323,7 +458,7 @@ class MainActivity : Activity() {
             dockBox.addView(column(
                 round(Ic.Plus, "Pick files", 58, Tone.Lime) { pickFiles() }.margins(t = dp(14)),
                 tv("Share or pick files", 18f, 600, C.WHITE).margins(t = dp(14)),
-                tv("Or tap Share → Akhri Pasta in any app", 14f, 400, C.ON_COBALT_MUTED).margins(t = dp(6), b = dp(16)),
+                tv("Or tap Share → FlashHop in any app", 14f, 400, C.ON_COBALT_MUTED).margins(t = dp(6), b = dp(16)),
             ).apply { gravity = Gravity.CENTER_HORIZONTAL; layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) })
         } else {
             dockBox.addView(outgoingTicket().margins(b = dp(12)))
@@ -370,18 +505,29 @@ class MainActivity : Activity() {
         *listOfNotNull(action).toTypedArray(),
     ).margins(b = dp(8))
 
+    /** Name (any case) or address. Mirrored in desktop `devices_ui`. */
+    private fun matching(peers: List<Peer>): List<Peer> {
+        val q = findInput.text.toString().trim()
+        return peers.filter { it.name.contains(q, ignoreCase = true) || it.ip.contains(q) }
+    }
+
+    /** The search field stays put (it keeps focus and the keyboard); only the header and rows rebuild. */
     private fun renderDevices(peers: List<Peer>) {
-        devicesCard.removeAllViews()
-        devicesCard.addView(sectionTitle("Devices", peers.size.takeIf { it > 0 }?.toString()))
+        devicesHead.removeAllViews()
+        devicesHead.addView(sectionTitle("Devices", peers.size.takeIf { it > 0 }?.toString()))
+        findInput.visibility = if (peers.size >= FIND_FROM || findInput.text.isNotEmpty()) View.VISIBLE else View.GONE
+        devicesRows.removeAllViews()
         if (peers.isEmpty()) {
-            devicesCard.addView(tv("Nothing here yet. Open Akhri Pasta on another device on the same network and it appears within a few seconds.", 14f, 400, C.MUTED, lines = 0))
+            devicesRows.addView(tv("Nothing here yet. Open FlashHop on another device on the same network and it appears within a few seconds.", 14f, 400, C.MUTED, lines = 0))
         }
+        val shown = matching(peers)
+        if (peers.isNotEmpty() && shown.isEmpty()) devicesRows.addView(tv("No device matches.", 14f, 400, C.MUTED))
         val ready = staged.isNotEmpty()
-        peers.forEachIndexed { i, p ->
-            if (i > 0) devicesCard.addView(hairline())
-            devicesCard.addView(row(
+        shown.forEachIndexed { i, p ->
+            if (i > 0) devicesRows.addView(hairline())
+            devicesRows.addView(row(
                 avatar(p.name, 44, C.RAISED, C.INK),
-                column(tv(p.name, 16f, 600, C.INK), tv(p.ip, 13f, 400, C.MUTED).margins(t = dp(3))).weight1().margins(l = dp(12), r = dp(8)),
+                column(tv(p.name, 16f, 600, C.INK), tv(p.detail, 13f, 400, C.MUTED).margins(t = dp(3))).weight1().margins(l = dp(12), r = dp(8)),
                 round(Ic.UpRight, if (ready) "Send to ${p.name}" else "Add files or text first", 52, Tone.Lime, ready) { send(p) },
             ))
         }
@@ -428,6 +574,9 @@ class MainActivity : Activity() {
 
     companion object {
         private const val PICK = 1
+        private const val PICK_DIR = 2
+        /** The device search shows from this many devices on. Mirrored in desktop main.rs. */
+        private const val FIND_FROM = 5
         private const val MAX_ROWS = 6
         @Volatile var ui: MainActivity? = null
         @Volatile var snap = Snap(emptyArray())
@@ -450,16 +599,21 @@ class MainActivity : Activity() {
             val nm = app.getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(NotificationChannel("offers", "Incoming files", NotificationManager.IMPORTANCE_HIGH))
             var lastOffer = 0L
-            thread(isDaemon = true, name = "akhri-watch") {
+            thread(isDaemon = true, name = "flashhop-watch") {
                 var seen = 0L
                 while (true) {
                     seen = Core.waitChange(seen, if (snap.jobs.any { it.active }) 250 else 30_000)
                     val s = Snap(Core.snapshot())
                     snap = s
                     main.post {
+                        val cm = app.getSystemService(ClipboardManager::class.java)
                         for (t in s.texts) {
-                            app.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Akhri Pasta", t))
+                            cm.setPrimaryClip(ClipData.newPlainText("FlashHop", t))
                             Toast.makeText(app, "Text received and copied", Toast.LENGTH_SHORT).show()
+                        }
+                        for (p in s.images) {
+                            cm.setPrimaryClip(ClipData.newUri(app.contentResolver, "FlashHop", ClipProvider.share(app, File(p))))
+                            Toast.makeText(app, "Image received and copied", Toast.LENGTH_SHORT).show()
                         }
                         for (o in s.offers.filter { it.id > lastOffer }) {
                             lastOffer = o.id

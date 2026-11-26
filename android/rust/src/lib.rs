@@ -1,7 +1,10 @@
-//! JNI bridge: `app.akhripasta.Core` (Kotlin) -> `akhri_core::Engine`. No logic lives here;
+//! JNI bridge: `app.flashhop.Core` (Kotlin) -> `flashhop_core::Engine`. No logic lives here;
 //! everything the desktop app does, the phone does through the same engine.
 
-use akhri_core::{Engine, net::Item};
+use flashhop_core::{
+    Engine,
+    net::{Clip, Item},
+};
 use jni::{
     JNIEnv,
     objects::{JIntArray, JObject, JObjectArray, JString},
@@ -37,10 +40,12 @@ fn strings(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
     out
 }
 
-/// Returns null on success, or an error message.
+/// Returns null on success, or an error message. Called again later to change the name or dir;
+/// `recent` (saved names joined by U+001F) only seeds a new engine.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_start(mut env: JNIEnv, _: JObject, name: JString, dir: JString) -> jstring {
+pub extern "system" fn Java_app_flashhop_Core_start(mut env: JNIEnv, _: JObject, name: JString, dir: JString, recent: JString) -> jstring {
     let (name, dir) = (string(&mut env, &name), PathBuf::from(string(&mut env, &dir)));
+    let recent: Vec<String> = string(&mut env, &recent).split(SEP).filter(|s| !s.is_empty()).map(Into::into).collect();
     if let Some(e) = engine() {
         *e.name.lock().unwrap() = name;
         *e.dir.lock().unwrap() = dir;
@@ -53,6 +58,7 @@ pub extern "system" fn Java_app_akhripasta_Core_start(mut env: JNIEnv, _: JObjec
     unsafe { signal(13, 1) }; // SIGPIPE -> SIG_IGN
     match Engine::start(name, dir) {
         Ok(e) => {
+            *e.recent.lock().unwrap() = recent;
             let _ = ENGINE.set(e);
             std::ptr::null_mut()
         }
@@ -61,7 +67,7 @@ pub extern "system" fn Java_app_akhripasta_Core_start(mut env: JNIEnv, _: JObjec
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_setName(mut env: JNIEnv, _: JObject, name: JString) {
+pub extern "system" fn Java_app_flashhop_Core_setName(mut env: JNIEnv, _: JObject, name: JString) {
     let name = string(&mut env, &name);
     if let Some(e) = engine() {
         *e.name.lock().unwrap() = name;
@@ -70,7 +76,7 @@ pub extern "system" fn Java_app_akhripasta_Core_setName(mut env: JNIEnv, _: JObj
 
 /// Blocks until something changes (or the timeout). Call from a background thread.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_waitChange(_: JNIEnv, _: JObject, seen: jlong, timeout_ms: jlong) -> jlong {
+pub extern "system" fn Java_app_flashhop_Core_waitChange(_: JNIEnv, _: JObject, seen: jlong, timeout_ms: jlong) -> jlong {
     match engine() {
         Some(e) => e.wait(seen as u64, Duration::from_millis(timeout_ms as u64)) as jlong,
         None => {
@@ -80,29 +86,37 @@ pub extern "system" fn Java_app_akhripasta_Core_waitChange(_: JNIEnv, _: JObject
     }
 }
 
-/// `akhri_core::headline` for the phone: strong and rest parts joined by U+001F.
+/// Recent device names, newest first, joined by U+001F (the app saves this).
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_headline(env: JNIEnv, _: JObject, peers: jint, items: jint) -> jstring {
-    let (strong, rest) = akhri_core::headline(peers.max(0) as usize, items.max(0) as usize, true);
+pub extern "system" fn Java_app_flashhop_Core_recent(env: JNIEnv, _: JObject) -> jstring {
+    let r = engine().map(|e| e.recent.lock().unwrap().join(&SEP.to_string())).unwrap_or_default();
+    env.new_string(r).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// `flashhop_core::headline` for the phone: strong and rest parts joined by U+001F.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_flashhop_Core_headline(env: JNIEnv, _: JObject, peers: jint, items: jint) -> jstring {
+    let (strong, rest) = flashhop_core::headline(peers.max(0) as usize, items.max(0) as usize, true);
     env.new_string(format!("{strong}{SEP}{rest}")).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 /// One record per string, fields separated by U+001F:
-/// `P id name ip` | `O id summary` | `J id label state incoming fraction status` | `T text`
+/// `P id name ip detail` | `O id summary` | `J id label state incoming fraction status` | `T text`
+/// | `I path` (a received clipboard image, already saved)
 /// where state is one of `w` (waiting), `r` (running), `d` (done), `f` (failed).
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_snapshot(mut env: JNIEnv, _: JObject) -> jobjectArray {
+pub extern "system" fn Java_app_flashhop_Core_snapshot(mut env: JNIEnv, _: JObject) -> jobjectArray {
     let mut recs: Vec<String> = vec![];
     if let Some(e) = engine() {
         let clean = |s: &str| s.replace(SEP, " ");
         for p in e.peers() {
-            recs.push(format!("P{SEP}{}{SEP}{}{SEP}{}", p.id as i64, clean(&p.name), p.ip));
+            recs.push(format!("P{SEP}{}{SEP}{}{SEP}{}{SEP}{}", p.id as i64, clean(&p.name), p.ip, clean(&p.detail())));
         }
         for o in e.offers() {
             recs.push(format!("O{SEP}{}{SEP}{}", o.id as i64, clean(&o.summary)));
         }
         for j in e.jobs() {
-            use akhri_core::net::State;
+            use flashhop_core::net::State;
             let state = match j.t.state() {
                 State::Waiting => 'w',
                 State::Running => 'r',
@@ -118,8 +132,11 @@ pub extern "system" fn Java_app_akhripasta_Core_snapshot(mut env: JNIEnv, _: JOb
                 clean(&j.status())
             ));
         }
-        for t in e.take_texts() {
-            recs.push(format!("T{SEP}{t}"));
+        for c in e.take_clips() {
+            recs.push(match c {
+                Clip::Text(t) => format!("T{SEP}{t}"),
+                Clip::Image(p) => format!("I{SEP}{}", p.display()),
+            });
         }
     }
     let build = |env: &mut JNIEnv| -> jni::errors::Result<jobjectArray> {
@@ -134,20 +151,30 @@ pub extern "system" fn Java_app_akhripasta_Core_snapshot(mut env: JNIEnv, _: JOb
 }
 
 /// `fds` are detached file descriptors (ownership moves to Rust), `names` their display names.
+/// The first `images` of them are clipboard images (PNG).
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_send(
+pub extern "system" fn Java_app_flashhop_Core_send(
     mut env: JNIEnv,
     _: JObject,
     peer: jlong,
     fds: JIntArray,
     names: JObjectArray,
     texts: JObjectArray,
+    images: jint,
 ) {
     let n = env.get_array_length(&fds).unwrap_or(0) as usize;
     let mut raw = vec![0; n];
     let _ = env.get_int_array_region(&fds, 0, &mut raw);
     let names = strings(&mut env, &names);
-    let mut items: Vec<Item> = raw.into_iter().zip(names).map(|(fd, name)| Item::Open(unsafe { File::from_raw_fd(fd) }, name)).collect();
+    let mut items: Vec<Item> = raw
+        .into_iter()
+        .zip(names)
+        .enumerate()
+        .map(|(i, (fd, name))| {
+            let f = unsafe { File::from_raw_fd(fd) };
+            if (i as jint) < images { Item::Image(f, name) } else { Item::Open(f, name) }
+        })
+        .collect();
     items.extend(strings(&mut env, &texts).into_iter().map(Item::Text));
     if let Some(e) = engine() {
         e.send(peer as u64, items);
@@ -155,21 +182,21 @@ pub extern "system" fn Java_app_akhripasta_Core_send(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_decide(_: JNIEnv, _: JObject, offer: jlong, accept: jboolean) {
+pub extern "system" fn Java_app_flashhop_Core_decide(_: JNIEnv, _: JObject, offer: jlong, accept: jboolean) {
     if let Some(e) = engine() {
         e.decide(offer as u64, accept != 0);
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_cancel(_: JNIEnv, _: JObject, job: jlong) {
+pub extern "system" fn Java_app_flashhop_Core_cancel(_: JNIEnv, _: JObject, job: jlong) {
     if let Some(e) = engine() {
         e.cancel(job as u64);
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_akhripasta_Core_clearFinished(_: JNIEnv, _: JObject) {
+pub extern "system" fn Java_app_flashhop_Core_clearFinished(_: JNIEnv, _: JObject) {
     if let Some(e) = engine() {
         e.clear_finished();
     }

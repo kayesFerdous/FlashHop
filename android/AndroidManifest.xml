@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="app.akhripasta"
-    android:versionCode="2"
-    android:versionName="0.2.0">
+    package="app.flashhop"
+    android:versionCode="3"
+    android:versionName="0.3.0">
 
     <!-- minSdk 30: apps may write their own files into Download/ with plain file paths. -->
     <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
@@ -14,7 +14,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
-        android:label="Akhri Pasta"
+        android:label="FlashHop"
         android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar"
         android:extractNativeLibs="false"
@@ -30,7 +30,7 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- "Share -> Akhri Pasta" from any app: the fastest way to send from a phone. -->
+            <!-- "Share -> FlashHop" from any app: the fastest way to send from a phone. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -42,5 +42,11 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+        <!-- Received clipboard images, handed to whichever app pastes them. -->
+        <provider
+            android:name=".ClipProvider"
+            android:authorities="app.flashhop.clip"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>
