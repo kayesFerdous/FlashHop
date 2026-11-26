@@ -262,21 +262,3 @@ class Ticks(ctx: Context) : View(ctx) {
         }
     }
 }
-
-/** A barcode drawn from [seed], so the same payload always prints the same code. */
-class Barcode(ctx: Context, private val seed: Long) : View(ctx) {
-    private val p = Paint().apply { color = C.INK }
-
-    override fun onDraw(c: Canvas) {
-        val u = context.dp(1f)
-        var x = 0f
-        var s = seed or 1L
-        while (x < width - 3 * u) {
-            s = s xor (s shl 13); s = s xor (s ushr 7); s = s xor (s shl 17)
-            val bar = (1 + (s and 3L).toInt() % 3) * u
-            val gap = (1.5f + ((s ushr 8) and 3L).toInt() % 3) * u
-            c.drawRect(x, 0f, minOf(x + bar, width.toFloat()), height.toFloat(), p)
-            x += bar + gap
-        }
-    }
-}

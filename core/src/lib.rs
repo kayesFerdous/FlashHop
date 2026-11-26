@@ -210,6 +210,18 @@ pub fn summarize(o: &net::Offer) -> String {
     format!("{} wants to send {} ({}){}", o.from, names.join(", "), human(total), more)
 }
 
+/// Two-tone headline naming the current step, as (strong, rest). `touch` picks the phone's verb.
+pub fn headline(peers: usize, staged: usize, touch: bool) -> (String, &'static str) {
+    let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    if peers == 0 {
+        ("Searching".into(), " for devices on this network…")
+    } else if staged == 0 {
+        (count(peers, "device"), if touch { " nearby. Share something to send." } else { " nearby. Drop something to send." })
+    } else {
+        (count(staged, "item"), " ready. Pick a device.")
+    }
+}
+
 pub fn human(b: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
     let i = (b.max(1).ilog(1024) as usize).min(units.len() - 1);

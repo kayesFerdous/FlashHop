@@ -12,6 +12,8 @@ object Core {
     /** Blocks until something changes after [seen]; returns the new generation. */
     external fun waitChange(seen: Long, timeoutMs: Long): Long
     external fun snapshot(): Array<String>
+    /** Headline wording from core: strong part and muted rest, joined by U+001F. */
+    external fun headline(peers: Int, items: Int): String
     /** [fds] are detached file descriptors; Rust takes ownership and closes them. */
     external fun send(peer: Long, fds: IntArray, names: Array<String>, texts: Array<String>)
     external fun decide(offer: Long, accept: Boolean)

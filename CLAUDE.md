@@ -34,7 +34,7 @@ android/rust/  cdylib "akhri": JNI bridge only, no logic
 android/src/   Kotlin screens; Core.kt declares the JNI functions and parses snapshots; Ui.kt = tokens + custom views
 ```
 
-**Sync rule:** behavior and every user-visible string live in `core`: discovery, offers, transfers, progress, file naming, `summarize()`, `Job::status()`, `human()`. Platform code only renders and does platform I/O (clipboard, notifications, file pickers, config). If both UIs would need the same change, it belongs in `core`.
+**Sync rule:** behavior and every user-visible string live in `core`: discovery, offers, transfers, progress, file naming, `summarize()`, `Job::status()`, `human()`, `headline()`. Platform code only renders and does platform I/O (clipboard, notifications, file pickers, config). If both UIs would need the same change, it belongs in `core`.
 
 **Wire protocol** (`core/src/net.rs`, format documented at the top of the file). If you change it, bump `MAGIC`, so old and new builds refuse each other.
 - Discovery: each device broadcasts every 2 s to 255.255.255.255:47821. A receiver replies unicast to every announce, so newcomers see everyone instantly. Peers expire after 7 s.
@@ -52,13 +52,14 @@ android/src/   Kotlin screens; Core.kt declares the JNI functions and parses sna
 - Function names are `Java_app_akhripasta_Core_<method>`, with Kotlin `object Core` and the package `app.akhripasta`.
 - `snapshot()` returns `Array<String>`, one record per element, fields split by U+001F: `P id name ip`, `O id summary`, `J id label state incoming fraction status` (state is `w`/`r`/`d`/`f`), `T text`. The `Snap` class parses these.
 - `snapshot()` drains received texts (`take_texts`), so only the watcher thread may call it.
+- `headline(peers, items)` returns core's headline as strong and rest parts joined by U+001F.
 - u64 ids cross JNI as `jlong` bit patterns.
 - The cdylib sets SIGPIPE to ignore itself, because a cdylib doesn't get Rust's usual runtime setup.
 
 **Desktop specifics:**
 - eframe uses `glow` (not wgpu) for size.
 - Fonts: eframe's `default_fonts` is off; `desktop/assets/Inter.ttf` (variable, OFL) is the only font. Weights come from its `wght`/`opsz` axes as named families (`ui::W`). No emoji/CJK fallback.
-- The window icon is rasterized at startup from the same geometry as `android/res/drawable/ic_launcher_fg.xml`.
+- The window icon is rasterized at startup (`ui::app_icon`) from the same geometry as `android/res/drawable/ic_launcher_fg.xml`. On macOS it gets Apple's icon-grid margin, because eframe also puts it in the Dock. The release workflow writes the `.app` icon from the same function (`ICON_PNG=<path> cargo test -p akhri_pasta icon`).
 - Linux is forced onto X11/XWayland through `NativeOptions::event_loop_builder`, because winit has no Wayland drag-and-drop. Dropping eframe's `wayland` feature isn't enough: `accesskit_winit` turns winit's wayland feature back on.
 - Paste order: clipboard file list → text → image (re-encoded to a temp PNG).
 - **Files…/Folder…** use `rfd` with only the `xdg-portal` feature (Linux: the desktop's own file manager dialog over D-Bus, no GTK; macOS: NSOpenPanel). The dialog future is created on the UI thread (macOS needs that) and awaited on a worker thread with `pollster`, so the window keeps repainting.
@@ -66,7 +67,7 @@ android/src/   Kotlin screens; Core.kt declares the JNI functions and parses sna
 
 **Android specifics:**
 - No Gradle, no AndroidX, no Compose. Only platform widgets, built in code.
-- `build.sh` runs cargo → kotlinc → aapt2 (compiles `res/`, which holds only the adaptive app icon; Kotlin never references `R`) → R8 (from build-tools `d8.jar`) → `jar` → zipalign `-P 16` → apksigner. Native libs are stored uncompressed (`extractNativeLibs=false`).
+- `build.sh` runs cargo → kotlinc → aapt2 (compiles `res/`, which holds the adaptive app icon and `ic_stat`, the monochrome mark used for notifications and the themed-icon layer; there is no `R` class, so Kotlin looks drawables up with `getIdentifier`) → R8 (from build-tools `d8.jar`) → `jar` → zipalign `-P 16` → apksigner. Native libs are stored uncompressed (`extractNativeLibs=false`).
 - R8 keep rules are in `android/rules.pro`.
 - minSdk 30 lets Rust write straight into `Download/AkhriPasta` with plain paths. targetSdk 36.
 - The Wi-Fi multicast lock is held only while the activity is visible.
