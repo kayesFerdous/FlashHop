@@ -95,7 +95,7 @@ components:
 
 **Creative North Star: "The Boarding Pass"**
 
-What you send or receive is a ticket: a white card with side notches, a dashed perforation and a barcode, held on a cobalt dock. Everything else is quiet: a lavender-grey ground with a soft cobalt wash at the top, white cards for devices and activity, and one lime "go" control per device. The look comes from the user's reference images (a cobalt event ticket, a lavender event app with lime arrow buttons, a soft-glass focus app with a black pill).
+What you send or receive is a ticket: a white card with side notches and a dashed perforation, held on a cobalt dock. Everything else is quiet: a lavender-grey ground with a soft cobalt wash at the top, white cards for devices and activity, and one lime "go" control per device. The look comes from the user's reference images (a cobalt event ticket, a lavender event app with lime arrow buttons, a soft-glass focus app with a black pill).
 
 It is an Operate surface: one screen, scanned in seconds, used many times a day by people who know what an IP is. Density stays moderate; the headline always names the current step.
 
@@ -146,7 +146,7 @@ Radii: pills are fully round; ticket 22; card 24; dock 28. Ticket notches are 11
 - **Pill**: 38px (desktop) / 48dp (Android) high, 13.5–14.5 semibold, optional leading icon. Tones: Ink (primary), Card (secondary on white), Ground (white on lavender), Glass (on cobalt), Lime (go). Hover lerps over 120ms; disabled drops to 35% fill.
 - **Round button**: same tones as pills. Disabled send shows a mist circle with a faded arrow. On Android the touch target is never under 48dp, even when the circle is drawn smaller.
 - **Dock**: cobalt block. Empty: lime "+" button (opens the file picker), "Drop files or folders" / "Share or pick files", helper line, glass pills (Files…, Folder…, Paste on desktop; Files, Paste on Android). Staged: the outgoing ticket, then the glass pills. Compact (nothing staged while an offer or transfer is live): one row of lime + and glass pills, and Activity moves above Devices so the live percentage stays in view. On narrow desktop windows the pills drop their icons instead of overflowing.
-- **Ticket**: top = title or offer summary with a badge; perforation; stub = barcode plus total (outgoing) or "Saves to" plus Decline/Accept (incoming). The barcode is derived from the staged names (same payload, same code); its caption is the item count, never an invented ID.
+- **Ticket**: top = title or offer summary with a badge; perforation; stub = item count and total (outgoing) or "Saves to" plus Decline/Accept (incoming). On send, the outgoing ticket is the one motion moment: it slides right by 60% of its width with ease-in and fades out over 320 ms, above the page, while the dock re-renders underneath.
 - **Device row**: avatar initial, name and IP, lime send round button.
 - **Job row**: state badge (amber waiting, cobalt running, green done, red failed), label, core status string ("Sent, 2.0 GB", "Couldn't connect. Is Akhri Pasta open on the other device?"), cancel while active; running rows add the big percentage and a tick bar.
 

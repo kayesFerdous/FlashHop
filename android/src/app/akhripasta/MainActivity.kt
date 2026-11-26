@@ -31,6 +31,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.AccelerateInterpolator
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.EditText
@@ -225,6 +226,14 @@ class MainActivity : Activity() {
         }
         if (fds.isEmpty() && texts.isEmpty()) return
         Core.send(peer.id, fds.toIntArray(), names.toTypedArray(), texts.toTypedArray())
+        // The ticket slides out over the page (ease-in, fading) while the dock re-renders under it.
+        // Mirrored in desktop App::ui.
+        (dockBox.getChildAt(0) as? Ticket)?.let { t ->
+            val host = window.decorView as ViewGroup
+            host.overlay.add(t)
+            t.animate().translationX(t.width * 0.6f).alpha(0f).setDuration(320)
+                .setInterpolator(AccelerateInterpolator()).withEndAction { host.overlay.remove(t) }.start()
+        }
         staged.clear()
         render()
     }
@@ -256,14 +265,9 @@ class MainActivity : Activity() {
 
     private fun card() = column().apply { background = rounded(C.CARD, 24f); setPadding(dp(18), dp(16), dp(18), dp(16)) }
 
-    /** Two-tone headline that names the current step. Mirrors `headline()` in desktop/src/main.rs. */
+    /** Two-tone headline that names the current step; wording comes from core. */
     private fun headlineText(peers: Int, items: Int): CharSequence {
-        fun count(n: Int, what: String) = "$n $what${if (n == 1) "" else "s"}"
-        val (strong, rest) = when {
-            peers == 0 -> "Searching" to " for devices on this network…"
-            items == 0 -> count(peers, "device") to " nearby. Share something to send."
-            else -> count(items, "item") to " ready. Pick a device."
-        }
+        val (strong, rest) = Core.headline(peers, items).split('\u001f')
         return SpannableStringBuilder(strong + rest).apply {
             setSpan(ForegroundColorSpan(C.MUTED), strong.length, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
@@ -347,11 +351,10 @@ class MainActivity : Activity() {
         }
         if (staged.size > MAX_ROWS) top.addView(tv("+${staged.size - MAX_ROWS} more", 14f, 500, C.MUTED).margins(t = dp(6)))
         val total = staged.mapNotNull { it.size }.sum()
-        val seed = staged.fold(-0x340d631b7bdddcdbL) { h, s -> s.label.fold(h) { a, ch -> (a xor ch.code.toLong()) * 0x100000001b3L } }
         stub.addView(row(
             column(
-                Barcode(context, seed).apply { layoutParams = LinearLayout.LayoutParams(dp(150), dp(34)) },
-                tv("${staged.size} item${if (staged.size == 1) "" else "s"}", 12f, 500, C.MUTED).margins(t = dp(5)),
+                tv("Items", 12f, 400, C.MUTED),
+                tv("${staged.size}", 20f, 600, C.INK).margins(t = dp(3)),
             ).weight1(),
             column(
                 tv(if (staged.any { it.size == null }) "Total, some unknown" else "Total", 12f, 400, C.MUTED),
@@ -473,7 +476,8 @@ class MainActivity : Activity() {
                 app, 0, Intent(app, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE,
             )
             val n = Notification.Builder(app, "offers")
-                .setSmallIcon(android.R.drawable.stat_sys_download)
+                // No generated R class (see build.sh), so look the drawable up by name.
+                .setSmallIcon(app.resources.getIdentifier("ic_stat", "drawable", app.packageName))
                 .setColor(C.COBALT)
                 .setContentTitle("Incoming files")
                 .setContentText(o.summary)

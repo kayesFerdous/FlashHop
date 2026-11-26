@@ -30,7 +30,8 @@ enum Kind {
 
 /// An item waiting to be sent, with what the ticket shows about it.
 struct Staged {
-    item: Item,
+    /// Taken when sent; the rest stays for the ticket's slide-out.
+    item: Option<Item>,
     name: String,
     kind: Kind,
     size: Option<u64>,
@@ -47,7 +48,7 @@ impl Staged {
             Item::Open(_, n) => (n.clone(), Kind::File, None),
             Item::Text(t) => (t.chars().take(80).collect::<String>().replace(['\n', '\r', '\t'], " "), Kind::Text, Some(t.len() as u64)),
         };
-        Self { item, name, kind, size }
+        Self { item: Some(item), name, kind, size }
     }
 }
 
@@ -67,6 +68,10 @@ struct App {
     /// Filled by the "Change…" folder picker in settings.
     save_dir: Arc<Mutex<Option<PathBuf>>>,
     settings: bool,
+    /// Where the outgoing ticket was last drawn.
+    ticket_rect: egui::Rect,
+    /// The ticket just sent (when, where, its rows), drawn sliding out over the page.
+    sent: Option<(f64, egui::Rect, Vec<Staged>)>,
 }
 
 fn main() -> eframe::Result {
@@ -78,7 +83,7 @@ fn main() -> eframe::Result {
             .with_inner_size([440.0, 720.0])
             .with_min_inner_size([360.0, 520.0])
             .with_app_id("akhri_pasta")
-            .with_icon(ui::app_icon()),
+            .with_icon(ui::app_icon(256)),
         // winit has no Wayland drag-and-drop; XWayland bridges drops from Wayland apps.
         #[cfg(target_os = "linux")]
         event_loop_builder: Some(Box::new(|b| {
@@ -101,6 +106,8 @@ fn main() -> eframe::Result {
                 picked: Default::default(),
                 save_dir: Default::default(),
                 settings: false,
+                ticket_rect: egui::Rect::NOTHING,
+                sent: None,
             }))
         }),
     )
@@ -164,10 +171,98 @@ impl eframe::App for App {
                 });
             });
         });
+        if let Some((at, rect, rows)) = &self.sent {
+            // Ease-in slide to the right with a fade; mirrored in MainActivity.send().
+            let t = ((ctx.input(|i| i.time) - at) / 0.32).min(1.0) as f32;
+            egui::Area::new(egui::Id::unique("sent-ticket"))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .constrain(false)
+                .fixed_pos(rect.min + egui::vec2(t * t * rect.width() * 0.6, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_width(rect.width());
+                    ui.set_opacity(1.0 - t);
+                    ticket_ui(ui, rows, egui::Color32::TRANSPARENT); // notch color would be wrong off the dock
+                });
+            if t < 1.0 {
+                ctx.request_repaint();
+            } else {
+                self.sent = None;
+            }
+        }
         if self.e.busy() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
     }
+}
+
+/// The outgoing ticket over `rows`. Returns (clear all, remove row) clicks; `under` fills the notches.
+fn ticket_ui(ui: &mut egui::Ui, rows: &[Staged], under: egui::Color32) -> (bool, Option<usize>) {
+    let (mut clear, mut remove) = (false, None);
+    let n = rows.len();
+    let total: u64 = rows.iter().filter_map(|s| s.size).sum();
+    let partial = rows.iter().any(|s| s.size.is_none());
+    ui::ticket(
+        ui,
+        Some(under),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label(ui::text("Outgoing", 19.0, W::Semibold, ui::INK));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui::round(ui, Icon::Close, "Clear all", 32.0, Tone::Card, true).clicked() {
+                        clear = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            for (i, s) in rows.iter().enumerate().take(MAX_ROWS) {
+                ui.horizontal(|ui| {
+                    let icon = match s.kind {
+                        Kind::File => Icon::File,
+                        Kind::Folder => Icon::Folder,
+                        Kind::Text => Icon::Text,
+                    };
+                    ui::glyph(ui, icon, 18.0, ui::MUTED, ui::WHITE);
+                    ui.add_space(2.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui::round(ui, Icon::Close, "Remove", 28.0, Tone::Ground, true).clicked() {
+                            remove = Some(i);
+                        }
+                        let size = match (&s.kind, s.size) {
+                            (Kind::Folder, _) => "Folder".into(),
+                            (_, Some(b)) => human(b),
+                            _ => String::new(),
+                        };
+                        ui.label(ui::text(size, 12.5, W::Regular, ui::MUTED));
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(Label::new(ui::text(&s.name, 14.0, W::Medium, ui::INK)).truncate());
+                        });
+                    });
+                });
+            }
+            if n > MAX_ROWS {
+                ui.label(ui::text(format!("+{} more", n - MAX_ROWS), 13.0, W::Medium, ui::MUTED));
+            }
+        },
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(ui::text("Items", 11.5, W::Regular, ui::MUTED));
+                    ui.label(ui::text(n.to_string(), 19.0, W::Semibold, ui::INK));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(ui::text(if partial { "Total, plus folders" } else { "Total" }, 11.5, W::Regular, ui::MUTED));
+                        let size = if total > 0 { human(total) } else { "—".into() };
+                        ui.label(ui::text(size, 19.0, W::Semibold, ui::INK));
+                    });
+                });
+            });
+        },
+    );
+    (clear, remove)
 }
 
 /// Centers a column of at most `MAX_W` with side margins.
@@ -185,18 +280,6 @@ fn column(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
             ui.add_space(28.0);
         });
     });
-}
-
-/// Two-tone headline that names the current step. Mirrored in MainActivity.headline().
-fn headline(peers: usize, staged: usize) -> (String, &'static str) {
-    let count = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
-    if peers == 0 {
-        ("Searching".into(), " for devices on this network…")
-    } else if staged == 0 {
-        (count(peers, "device"), " nearby. Drop something to send.")
-    } else {
-        (count(staged, "item"), " ready. Pick a device.")
-    }
 }
 
 impl App {
@@ -270,7 +353,7 @@ impl App {
     fn main_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, peers: &[Peer], offers: &[Offer], jobs: &[Job], hot: bool) {
         self.top_bar(ui);
         ui.add_space(28.0);
-        let (strong, rest) = headline(peers.len(), self.staged.len());
+        let (strong, rest) = akhri_core::headline(peers.len(), self.staged.len(), false);
         ui::headline(ui, &strong, rest);
         ui.add_space(20.0);
         for o in offers {
@@ -354,7 +437,7 @@ impl App {
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add(Label::new(ui::text("Saves to", 11.5, W::Regular, ui::MUTED)).truncate());
-                            ui.add(Label::new(ui::text(dest, 13.0, W::Medium, ui::INK)).truncate());
+                            ui::path_label(ui, &dest, 13.0, W::Medium, ui::INK);
                         });
                     });
                 });
@@ -399,86 +482,19 @@ impl App {
                     ui.add_space(12.0);
                 });
             } else {
-                self.ticket_ui(ui);
+                let r = ui.scope(|ui| ticket_ui(ui, &self.staged, ui::COBALT));
+                self.ticket_rect = r.response.rect;
+                match r.inner {
+                    (true, _) => self.staged.clear(),
+                    (_, Some(i)) => drop(self.staged.remove(i)),
+                    _ => {}
+                }
                 ui.add_space(12.0);
             }
             let which = add_buttons(ui, Tone::Glass, true);
             self.add(ui.ctx(), frame, which);
             ui.add_space(2.0);
         });
-    }
-
-    fn ticket_ui(&mut self, ui: &mut egui::Ui) {
-        let (mut clear, mut remove) = (false, None);
-        let n = self.staged.len();
-        let total: u64 = self.staged.iter().filter_map(|s| s.size).sum();
-        let partial = self.staged.iter().any(|s| s.size.is_none());
-        let seed = self.staged.iter().fold(0xcbf29ce484222325u64, |h, s| s.name.bytes().fold(h, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)));
-        ui::ticket(
-            ui,
-            Some(ui::COBALT),
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(ui::text("Outgoing", 19.0, W::Semibold, ui::INK));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui::round(ui, Icon::Close, "Clear all", 32.0, Tone::Card, true).clicked() {
-                            clear = true;
-                        }
-                    });
-                });
-                ui.add_space(2.0);
-                for (i, s) in self.staged.iter().enumerate().take(MAX_ROWS) {
-                    ui.horizontal(|ui| {
-                        let icon = match s.kind {
-                            Kind::File => Icon::File,
-                            Kind::Folder => Icon::Folder,
-                            Kind::Text => Icon::Text,
-                        };
-                        ui::glyph(ui, icon, 18.0, ui::MUTED, ui::WHITE);
-                        ui.add_space(2.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui::round(ui, Icon::Close, "Remove", 28.0, Tone::Ground, true).clicked() {
-                                remove = Some(i);
-                            }
-                            let size = match (&s.kind, s.size) {
-                                (Kind::Folder, _) => "Folder".into(),
-                                (_, Some(b)) => human(b),
-                                _ => String::new(),
-                            };
-                            ui.label(ui::text(size, 12.5, W::Regular, ui::MUTED));
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add(Label::new(ui::text(&s.name, 14.0, W::Medium, ui::INK)).truncate());
-                            });
-                        });
-                    });
-                }
-                if n > MAX_ROWS {
-                    ui.label(ui::text(format!("+{} more", n - MAX_ROWS), 13.0, W::Medium, ui::MUTED));
-                }
-            },
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        ui::barcode(ui, seed, (ui.available_width() * 0.5).min(180.0));
-                        ui.label(ui::text(format!("{n} item{}", if n == 1 { "" } else { "s" }), 12.0, W::Medium, ui::MUTED));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                        ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(ui::text(if partial { "Total, plus folders" } else { "Total" }, 11.5, W::Regular, ui::MUTED));
-                            let size = if total > 0 { human(total) } else { "—".into() };
-                            ui.label(ui::text(size, 19.0, W::Semibold, ui::INK));
-                        });
-                    });
-                });
-            },
-        );
-        if clear {
-            self.staged.clear();
-        } else if let Some(i) = remove {
-            self.staged.remove(i);
-        }
     }
 
     fn devices_ui(&mut self, ui: &mut egui::Ui, peers: &[Peer]) {
@@ -499,7 +515,8 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let tip = if ready { format!("Send to {}", p.name) } else { "Add files or text first".into() };
                         if ui::round(ui, Icon::UpRight, &tip, 44.0, Tone::Lime, ready).clicked() {
-                            self.e.send(p.id, self.staged.drain(..).map(|s| s.item).collect());
+                            self.e.send(p.id, self.staged.iter_mut().filter_map(|s| s.item.take()).collect());
+                            self.sent = Some((ui.input(|i| i.time), self.ticket_rect, std::mem::take(&mut self.staged)));
                         }
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
@@ -600,7 +617,7 @@ impl App {
         ui::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(ui::text("Received files", 13.0, W::Medium, ui::MUTED));
-            ui.add(Label::new(ui::text(tilde(&self.e.dir.lock().unwrap()), 14.5, W::Medium, ui::INK)).truncate());
+            ui::path_label(ui, &tilde(&self.e.dir.lock().unwrap()), 14.5, W::Medium, ui::INK);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui::pill(ui, "Change…", Some(Icon::Folder), Tone::Ink, true).clicked() {
@@ -676,13 +693,17 @@ fn tilde(p: &Path) -> String {
 fn save_png(w: u32, h: u32, rgba: &[u8]) -> std::io::Result<PathBuf> {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let path = std::env::temp_dir().join(format!("clipboard-{secs}.png"));
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(fs::File::create(&path)?), w, h);
+    write_png(&path, w, h, rgba)?;
+    Ok(path)
+}
+
+fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(fs::File::create(path)?), w, h);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     let mut wr = enc.write_header().map_err(std::io::Error::other)?;
     wr.write_image_data(rgba).map_err(std::io::Error::other)?;
-    wr.finish().map_err(std::io::Error::other)?;
-    Ok(path)
+    wr.finish().map_err(std::io::Error::other)
 }
 
 /// System notification without extra crates. Message goes in argv, never into a script.
@@ -733,4 +754,38 @@ fn hostname() -> String {
     let raw = fs::read("/proc/sys/kernel/hostname").unwrap_or_default();
     let s = String::from_utf8_lossy(&raw).trim().to_string();
     if s.is_empty() { "My device".into() } else { s }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Renders the app icon. With ICON_PNG=<path> it also writes it there at 1024 px; the release
+    /// workflow turns that into the macOS .icns, so the bundle icon and window icon match.
+    #[test]
+    fn icon() {
+        let i = super::ui::app_icon(1024);
+        let alpha = |x: usize, y: usize| i.rgba[(y * 1024 + x) * 4 + 3];
+        assert_eq!((alpha(0, 0), alpha(512, 512)), (0, 255), "transparent corner, opaque tile");
+        if let Some(p) = std::env::var_os("ICON_PNG") {
+            super::write_png(p.as_ref(), 1024, 1024, &i.rgba).unwrap();
+        }
+    }
+
+    #[test]
+    fn long_path_keeps_its_end() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        super::ui::setup(&ctx);
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0))), ..Default::default() };
+        let path = "~/some/very/long/folder/that/ends/in/AkhriPasta";
+        let mut shown = String::new();
+        for _ in 0..2 {
+            // fonts load on the first frame
+            let out = ctx.run_ui(input(), |ui| {
+                super::ui::path_label(ui, path, 14.5, super::W::Medium, super::ui::INK);
+            });
+            shown = out.shapes.iter().find_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.text().to_owned()) } else { None }).unwrap();
+            out.drop_without_applying_deltas();
+        }
+        assert!(shown.starts_with('…') && shown.ends_with("/AkhriPasta"), "{shown}");
+    }
 }

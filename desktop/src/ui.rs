@@ -76,6 +76,19 @@ pub fn text(s: impl Into<String>, size: f32, w: W, color: Color32) -> RichText {
     RichText::new(s).font(font(size, w)).color(color)
 }
 
+/// One-line path that drops characters from the start ("…/AkhriPasta"), so the folder name stays
+/// visible. The full path shows on hover.
+pub fn path_label(ui: &mut Ui, path: &str, size: f32, w: W, color: Color32) -> Response {
+    let fits = |s: &str| ui.painter().layout_no_wrap(s.to_owned(), font(size, w), color).size().x <= ui.available_width();
+    let mut shown = path.to_owned();
+    let mut chars = path.char_indices().skip(1);
+    while !fits(&shown) {
+        let Some((i, _)) = chars.next() else { break };
+        shown = format!("…{}", &path[i..]);
+    }
+    ui.add(egui::Label::new(text(shown, size, w, color)).truncate()).on_hover_text(path)
+}
+
 pub fn setup(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::empty();
     for w in W::ALL {
@@ -316,21 +329,6 @@ pub fn ticket<R>(ui: &mut Ui, under: Option<Color32>, top: impl FnOnce(&mut Ui),
     inner.inner
 }
 
-/// A barcode drawn from `seed`, so the same payload always prints the same code.
-pub fn barcode(ui: &mut Ui, seed: u64, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
-    let p = ui.painter();
-    let (mut x, mut s) = (rect.left(), seed | 1);
-    while x < rect.right() - 3.0 {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        let (bar, gap) = (1.0 + (s % 3) as f32, 1.5 + ((s >> 8) % 3) as f32);
-        p.rect_filled(Rect::from_min_max(pos2(x, rect.top()), pos2((x + bar).min(rect.right()), rect.bottom())), CornerRadius::ZERO, INK);
-        x += bar + gap;
-    }
-}
-
 /// Progress as a row of thin ticks: lit in cobalt, the leading tick in ink.
 pub fn ticks(ui: &mut Ui, fraction: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
@@ -471,9 +469,11 @@ pub fn paint(p: &Painter, icon: Icon, rect: Rect, color: Color32, bg: Color32) {
 
 /// Window icon, rasterized from the same geometry as android/res/drawable/ic_launcher_fg.xml
 /// (108-unit adaptive-icon canvas): a white ticket with an up-right arrow on a cobalt tile.
-pub fn app_icon() -> egui::IconData {
-    const N: u32 = 256;
-    let unit = 108.0 / N as f32; // canvas units per pixel
+/// macOS shows icons unmasked, so there the tile gets Apple's grid margin (824 of 1024 px);
+/// eframe also puts this icon in the Dock, so it must match the .app bundle icon.
+pub fn app_icon(n: u32) -> egui::IconData {
+    let canvas: f32 = if cfg!(target_os = "macos") { 100.0 * 1024.0 / 824.0 } else { 108.0 }; // tile is 100 units
+    let (unit, pad) = (canvas / n as f32, (canvas - 108.0) / 2.0); // canvas units per pixel, margin
     let cover = |sd: f32| (0.5 - sd / unit).clamp(0.0, 1.0);
     let rrect = |x: f32, y: f32, (x0, y0, x1, y1): (f32, f32, f32, f32), r: f32| {
         let (cx, cy, hx, hy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, (x1 - x0) / 2.0 - r, (y1 - y0) / 2.0 - r);
@@ -485,10 +485,10 @@ pub fn app_icon() -> egui::IconData {
         let h = ((px * ex + py * ey) / (ex * ex + ey * ey)).clamp(0.0, 1.0);
         (px - ex * h).hypot(py - ey * h) - w / 2.0
     };
-    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
-    for j in 0..N {
-        for i in 0..N {
-            let (x, y) = ((i as f32 + 0.5) * unit, (j as f32 + 0.5) * unit);
+    let mut rgba = Vec::with_capacity((n * n * 4) as usize);
+    for j in 0..n {
+        for i in 0..n {
+            let (x, y) = ((i as f32 + 0.5) * unit - pad, (j as f32 + 0.5) * unit - pad);
             let tile_c = Color32::from_rgb(0x4A, 0x6E, 0xF5).lerp_to_gamma(Color32::from_rgb(0x24, 0x44, 0xCC), y / 108.0);
             let tile = cover(rrect(x, y, (4.0, 4.0, 104.0, 104.0), 24.0));
             let notch = ((x - 64.0).hypot(y - 36.0) - 5.5).min((x - 64.0).hypot(y - 72.0) - 5.5);
@@ -501,5 +501,5 @@ pub fn app_icon() -> egui::IconData {
             rgba.extend([px(tile_c.r()), px(tile_c.g()), px(tile_c.b()), (tile * 255.0) as u8]);
         }
     }
-    egui::IconData { rgba, width: N, height: N }
+    egui::IconData { rgba, width: n, height: n }
 }

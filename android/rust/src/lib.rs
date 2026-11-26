@@ -5,7 +5,7 @@ use akhri_core::{Engine, net::Item};
 use jni::{
     JNIEnv,
     objects::{JIntArray, JObject, JObjectArray, JString},
-    sys::{jboolean, jlong, jobjectArray, jstring},
+    sys::{jboolean, jint, jlong, jobjectArray, jstring},
 };
 use std::{
     fs::File,
@@ -78,6 +78,13 @@ pub extern "system" fn Java_app_akhripasta_Core_waitChange(_: JNIEnv, _: JObject
             seen
         }
     }
+}
+
+/// `akhri_core::headline` for the phone: strong and rest parts joined by U+001F.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_akhripasta_Core_headline(env: JNIEnv, _: JObject, peers: jint, items: jint) -> jstring {
+    let (strong, rest) = akhri_core::headline(peers.max(0) as usize, items.max(0) as usize, true);
+    env.new_string(format!("{strong}{SEP}{rest}")).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 /// One record per string, fields separated by U+001F:
