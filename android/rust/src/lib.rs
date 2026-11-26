@@ -41,9 +41,17 @@ fn strings(env: &mut JNIEnv, arr: &JObjectArray) -> Vec<String> {
 }
 
 /// Returns null on success, or an error message. Called again later to change the name or dir;
-/// `recent` (saved names joined by U+001F) only seeds a new engine.
+/// `recent` (saved names joined by U+001F) and `state` (private folder for the device key and
+/// trusted keys) only seed a new engine.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_app_flashhop_Core_start(mut env: JNIEnv, _: JObject, name: JString, dir: JString, recent: JString) -> jstring {
+pub extern "system" fn Java_app_flashhop_Core_start(
+    mut env: JNIEnv,
+    _: JObject,
+    name: JString,
+    dir: JString,
+    recent: JString,
+    state: JString,
+) -> jstring {
     let (name, dir) = (string(&mut env, &name), PathBuf::from(string(&mut env, &dir)));
     let recent: Vec<String> = string(&mut env, &recent).split(SEP).filter(|s| !s.is_empty()).map(Into::into).collect();
     if let Some(e) = engine() {
@@ -56,7 +64,7 @@ pub extern "system" fn Java_app_flashhop_Core_start(mut env: JNIEnv, _: JObject,
         fn signal(sig: i32, handler: usize) -> usize;
     }
     unsafe { signal(13, 1) }; // SIGPIPE -> SIG_IGN
-    match Engine::start(name, dir) {
+    match Engine::start(name, dir, PathBuf::from(string(&mut env, &state))) {
         Ok(e) => {
             *e.recent.lock().unwrap() = recent;
             let _ = ENGINE.set(e);

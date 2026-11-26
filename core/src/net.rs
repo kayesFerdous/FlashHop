@@ -1,9 +1,14 @@
 //! LAN discovery (UDP broadcast) and transfer (one TCP connection per send).
 //! Wire format is shared by every platform: change it here, bump MAGIC, and both apps follow.
 //!
-//! Discovery packet: MAGIC | id u64 | kind u8 (0 announce, 1 reply) | name utf8
-//! Transfer: sender -> MAGIC | name | count u32 | count * (kind u8, path, size u64)
-//!           kind: 0 file, 1 text, 2 clipboard image (a PNG file; older builds just save it)
+//! Discovery packet: MAGIC | id u64 | kind u8 (0 announce, 1 reply) | public key [32] | name utf8
+//! Transfer: sender -> MAGIC (plain), then a Noise_XX_25519_ChaChaPoly_BLAKE2s handshake
+//!           (3 messages, each a u16 length + bytes; prologue = MAGIC) that proves both devices'
+//!           permanent keys: the sender aborts unless the receiver's key is the one it announced.
+//!           Everything after is
+//!           encrypted in frames of u16 length + ChaCha20-Poly1305 ciphertext (≤ 65535 bytes):
+//!           sender -> name | count u32 | count * (kind u8, path, size u64)
+//!           kind: 0 file, 1 text, 2 clipboard image (a PNG file)
 //!           receiver -> 1 (accept) / 0 (decline)
 //!           sender -> raw bytes of every entry, in order
 //!           receiver -> 1 (all saved)
@@ -23,7 +28,7 @@ use std::{
 };
 
 pub const PORT: u16 = 47821;
-const MAGIC: &[u8; 4] = b"AKP1";
+const MAGIC: &[u8; 4] = b"AKP2";
 const ANNOUNCE: Duration = Duration::from_secs(2);
 const EXPIRE: Duration = Duration::from_secs(7);
 const CHUNK: u64 = 4 << 20; // progress update granularity
@@ -52,6 +57,8 @@ pub enum Clip {
 pub struct Peer {
     pub name: String,
     pub ip: IpAddr,
+    /// Its permanent public key, as announced. The transfer handshake must prove it.
+    pub key: [u8; 32],
     seen: Instant,
 }
 
@@ -71,6 +78,8 @@ pub struct Entry {
 
 pub struct Offer {
     pub from: String,
+    /// The sender's permanent public key, proven by the handshake.
+    pub key: [u8; 32],
     pub entries: Vec<Entry>,
 }
 
@@ -125,7 +134,7 @@ impl Transfer {
         }
         *self.state.lock().unwrap() = s;
     }
-    fn end<T>(&self, r: io::Result<T>) -> Option<T> {
+    pub(crate) fn end<T>(&self, r: io::Result<T>) -> Option<T> {
         let _ = self.ended.set(Instant::now());
         *self.sock.lock().unwrap() = None;
         match r {
@@ -161,8 +170,8 @@ fn describe(e: &io::Error) -> String {
 /// Runs forever: broadcasts our name every 2s, records peers, answers announces
 /// directly so newcomers see everyone instantly. `changed` fires when the list changes.
 // ponytail: 255.255.255.255 leaves via the default route only; per-interface broadcast if multi-NIC matters.
-pub fn discovery(sock: UdpSocket, id: u64, name: &Mutex<String>, peers: &Mutex<HashMap<u64, Peer>>, changed: impl Fn()) {
-    let packet = |kind: u8| [MAGIC.as_slice(), &id.to_le_bytes(), &[kind], name.lock().unwrap().as_bytes()].concat();
+pub fn discovery(sock: UdpSocket, id: u64, key: [u8; 32], name: &Mutex<String>, peers: &Mutex<HashMap<u64, Peer>>, changed: impl Fn()) {
+    let packet = |kind: u8| [MAGIC.as_slice(), &id.to_le_bytes(), &[kind], &key, name.lock().unwrap().as_bytes()].concat();
     let mut next = Instant::now();
     let mut buf = [0u8; 512];
     loop {
@@ -179,7 +188,7 @@ pub fn discovery(sock: UdpSocket, id: u64, name: &Mutex<String>, peers: &Mutex<H
         }
         let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
         let b = &buf[..n];
-        if n < 13 || &b[..4] != MAGIC {
+        if n < 45 || &b[..4] != MAGIC {
             continue;
         }
         let pid = u64::from_le_bytes(b[4..12].try_into().unwrap());
@@ -189,11 +198,11 @@ pub fn discovery(sock: UdpSocket, id: u64, name: &Mutex<String>, peers: &Mutex<H
         if b[12] == 0 {
             let _ = sock.send_to(&packet(1), from);
         }
-        let peer = Peer { name: String::from_utf8_lossy(&b[13..]).into_owned(), ip: from.ip(), seen: Instant::now() };
-        let key = (peer.name.clone(), peer.ip);
+        let peer = Peer { name: String::from_utf8_lossy(&b[45..]).into_owned(), ip: from.ip(), key: b[13..45].try_into().unwrap(), seen: Instant::now() };
+        let what = (peer.name.clone(), peer.ip, peer.key);
         let old = peers.lock().unwrap().insert(pid, peer);
-        if old.is_none_or(|o| (o.name, o.ip) != key) {
-            eprintln!("peer: {} at {}", key.0, key.1);
+        if old.is_none_or(|o| (o.name, o.ip, o.key) != what) {
+            eprintln!("peer: {} at {}", what.0, what.1);
             changed();
         }
     }
@@ -219,7 +228,8 @@ fn expand(items: Vec<Item>) -> io::Result<Vec<(Entry, Src)>> {
             Item::Text(t) => out.push((Entry { text: true, image: false, name: String::new(), size: t.len() as u64 }, Src::Text(t))),
             Item::Open(f, name) | Item::Image(f, name) => {
                 let size = f.metadata()?.len();
-                let name = if name.is_empty() { "file".into() } else { name.replace('/', "_") };
+                // A relative path ("Folder/sub/a.jpg", Android folder sends) keeps its folders.
+                let name = if name.is_empty() { "file".into() } else if safe_rel(&name) { name } else { name.replace('/', "_") };
                 out.push((Entry { text: false, image, name, size }, Src::Open(f)));
             }
             Item::Path(p) => {
@@ -248,17 +258,24 @@ fn walk(p: &Path, name: String, out: &mut Vec<(Entry, Src)>) -> io::Result<()> {
     Ok(())
 }
 
-pub fn send(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) {
-    t.end(send_inner(addr, me, items, t));
+/// Sends to `addr`, which must prove it holds the private half of `expect` (its announced key).
+/// `None` skips that check; only the headless test peer uses it.
+pub fn send(addr: SocketAddr, me: &str, id: &Identity, expect: Option<[u8; 32]>, items: Vec<Item>, t: &Transfer) {
+    t.end(send_inner(addr, me, id, expect, items, t));
 }
 
-fn send_inner(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) -> io::Result<()> {
+fn send_inner(addr: SocketAddr, me: &str, id: &Identity, expect: Option<[u8; 32]>, items: Vec<Item>, t: &Transfer) -> io::Result<()> {
     let entries = expand(items)?;
     t.total.store(entries.iter().map(|(e, _)| e.size).sum(), Relaxed);
     let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     *t.sock.lock().unwrap() = Some(sock.try_clone()?);
-    let mut w = BufWriter::with_capacity(BUF, &sock);
-    w.write_all(MAGIC)?;
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let (secure, theirs) = Secure::connect(&sock, id)?;
+    if expect.is_some_and(|k| k != theirs) {
+        return Err(io::Error::other("Not sent: it couldn't prove it's that device."));
+    }
+    let mut w = BufWriter::with_capacity(BUF, secure);
+    sock.set_read_timeout(None)?; // the receiver may take its time to accept
     put_str(&mut w, me)?;
     w.write_all(&u32::try_from(entries.len()).map_err(|_| bad("too many files"))?.to_le_bytes())?;
     for (e, _) in &entries {
@@ -267,7 +284,7 @@ fn send_inner(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) -> io:
         w.write_all(&e.size.to_le_bytes())?;
     }
     w.flush()?;
-    if get::<1>(&mut &sock)? != [1] {
+    if get::<1>(w.get_mut())? != [1] {
         return Err(io::Error::other("declined"));
     }
     t.set(State::Running);
@@ -284,7 +301,7 @@ fn send_inner(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) -> io:
     }
     w.flush()?;
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
-    if get::<1>(&mut &sock)? != [1] {
+    if get::<1>(w.get_mut())? != [1] {
         return Err(bad("receiver failed to save"));
     }
     Ok(())
@@ -294,17 +311,15 @@ fn send_inner(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) -> io:
 
 /// Reads the offer, asks `ask` (blocks until the user decides), then saves into `dir`.
 /// Returns what goes on the clipboard: received texts and clipboard images.
-pub fn receive(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> Vec<Clip> {
-    t.end(receive_inner(sock, dir, t, ask)).unwrap_or_default()
+pub fn receive(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> Vec<Clip> {
+    t.end(receive_inner(sock, dir, id, t, ask)).unwrap_or_default()
 }
 
-fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> io::Result<Vec<Clip>> {
+fn receive_inner(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> io::Result<Vec<Clip>> {
     *t.sock.lock().unwrap() = Some(sock.try_clone()?);
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut r = BufReader::with_capacity(BUF, &sock);
-    if &get::<4>(&mut r)? != MAGIC {
-        return Err(bad("not an flashhop sender"));
-    }
+    let (secure, key) = Secure::accept(&sock, id)?;
+    let mut r = BufReader::with_capacity(BUF, secure);
     let from = get_str(&mut r)?;
     let n = u32::from_le_bytes(get(&mut r)?);
     let mut entries = vec![];
@@ -317,13 +332,13 @@ fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Of
         }
         entries.push(e);
     }
-    let offer = Offer { from, entries };
+    let offer = Offer { from, key, entries };
     t.total.store(offer.entries.iter().map(|e| e.size).sum(), Relaxed);
     if !ask(&offer) {
-        let _ = (&sock).write_all(&[0]);
+        let _ = r.get_mut().write_all(&[0]);
         return Err(io::Error::other("declined"));
     }
-    (&sock).write_all(&[1])?;
+    r.get_mut().write_all(&[1])?;
     t.set(State::Running);
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
     fs::create_dir_all(dir)?;
@@ -359,7 +374,7 @@ fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Of
             clips.push(Clip::Image(path));
         }
     }
-    (&sock).write_all(&[1])?;
+    r.get_mut().write_all(&[1])?;
     Ok(clips)
 }
 
@@ -382,10 +397,143 @@ fn unique(dir: &Path, name: &str) -> PathBuf {
     (1..).map(|i| dir.join(format!("{stem} ({i}){ext}"))).find(|p| free(p)).unwrap()
 }
 
+// ---------- encryption ----------
+
+const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+const FRAME: usize = 65535; // Noise's message limit
+const TAG: usize = 16;
+
+/// This device's permanent X25519 key pair. The public half is its identity on the network.
+pub struct Identity {
+    secret: Vec<u8>,
+    pub public: [u8; 32],
+}
+
+impl Identity {
+    pub fn generate() -> io::Result<Self> {
+        let k = noise()?.generate_keypair().map_err(crypto)?;
+        Ok(Self { secret: k.private, public: k.public.try_into().map_err(|_| bad("bad key size"))? })
+    }
+
+    /// Reads `path` (secret ‖ public, 64 bytes), or creates it (owner-only) on first run.
+    pub fn load_or_create(path: &Path) -> io::Result<Self> {
+        if let Ok(b) = fs::read(path)
+            && b.len() == 64
+        {
+            return Ok(Self { secret: b[..32].to_vec(), public: b[32..].try_into().unwrap() });
+        }
+        let id = Self::generate()?;
+        let mut o = fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        o.open(path)?.write_all(&[id.secret.as_slice(), &id.public].concat())?;
+        Ok(id)
+    }
+}
+
+/// The transfer stream after MAGIC: a Noise XX handshake (fresh ephemeral keys plus both devices'
+/// permanent keys), then ChaCha20-Poly1305 frames (u16 length + ciphertext) both ways.
+// ponytail: trust on first use. The first contact with a device isn't verified (no codes to
+// compare, by choice); every later one is. Add a code comparison at first contact if that matters.
+struct Secure<'a> {
+    sock: &'a TcpStream,
+    noise: snow::TransportState,
+    plain: Vec<u8>, // decrypted bytes not yet read
+    pos: usize,
+    frame: Vec<u8>,
+}
+
+impl<'a> Secure<'a> {
+    /// Sender side: MAGIC, then the initiator half of the handshake. Returns the receiver's proven key.
+    fn connect(sock: &'a TcpStream, me: &Identity) -> io::Result<(Self, [u8; 32])> {
+        let mut hs = noise()?.local_private_key(&me.secret).map_err(crypto)?.build_initiator().map_err(crypto)?;
+        let mut buf = vec![0; FRAME];
+        let n = hs.write_message(&[], &mut buf).map_err(crypto)?; // -> e
+        put_frame(sock, MAGIC, &buf[..n])?;
+        hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?; // <- e, ee, s, es
+        let n = hs.write_message(&[], &mut buf).map_err(crypto)?; // -> s, se
+        put_frame(sock, &[], &buf[..n])?;
+        Self::new(sock, hs)
+    }
+
+    /// Receiver side: checks MAGIC, then answers the handshake. Returns the sender's proven key.
+    fn accept(sock: &'a TcpStream, me: &Identity) -> io::Result<(Self, [u8; 32])> {
+        if &get::<4>(&mut &*sock)? != MAGIC {
+            return Err(bad("not a FlashHop sender (or a different version)"));
+        }
+        let mut hs = noise()?.local_private_key(&me.secret).map_err(crypto)?.build_responder().map_err(crypto)?;
+        let mut buf = vec![0; FRAME];
+        hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?;
+        let n = hs.write_message(&[], &mut buf).map_err(crypto)?;
+        put_frame(sock, &[], &buf[..n])?;
+        hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?;
+        Self::new(sock, hs)
+    }
+
+    fn new(sock: &'a TcpStream, hs: snow::HandshakeState) -> io::Result<(Self, [u8; 32])> {
+        let theirs = hs.get_remote_static().and_then(|k| k.try_into().ok()).ok_or_else(|| bad("no device key"))?;
+        let noise = hs.into_transport_mode().map_err(crypto)?;
+        Ok((Self { sock, noise, plain: vec![], pos: 0, frame: vec![0; FRAME + 2] }, theirs))
+    }
+}
+
+impl Read for Secure<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.plain.len() {
+            let mut s = self.sock;
+            let len = u16::from_le_bytes(get(&mut s)?) as usize;
+            s.read_exact(&mut self.frame[..len])?;
+            self.plain.resize(len, 0);
+            let n = self.noise.read_message(&self.frame[..len], &mut self.plain).map_err(crypto)?;
+            self.plain.truncate(n);
+            self.pos = 0;
+        }
+        let n = out.len().min(self.plain.len() - self.pos);
+        out[..n].copy_from_slice(&self.plain[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl Write for Secure<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(FRAME - TAG);
+        if n == 0 {
+            return Ok(0);
+        }
+        let len = self.noise.write_message(&buf[..n], &mut self.frame[2..]).map_err(crypto)?;
+        self.frame[..2].copy_from_slice(&(len as u16).to_le_bytes());
+        (&*self.sock).write_all(&self.frame[..len + 2])?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn noise() -> io::Result<snow::Builder<'static>> {
+    snow::Builder::new(NOISE.parse().map_err(crypto)?).prologue(MAGIC).map_err(crypto)
+}
+
+fn put_frame(mut s: &TcpStream, prefix: &[u8], b: &[u8]) -> io::Result<()> {
+    s.write_all(&[prefix, &(b.len() as u16).to_le_bytes(), b].concat())
+}
+
+fn get_frame(mut s: &TcpStream) -> io::Result<Vec<u8>> {
+    let mut b = vec![0; u16::from_le_bytes(get(&mut s)?) as usize];
+    s.read_exact(&mut b)?;
+    Ok(b)
+}
+
+fn crypto(e: snow::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("encryption: {e}"))
+}
+
 // ---------- wire helpers ----------
 
-/// Copies exactly `len` bytes in chunks so progress can update. `io::copy` keeps
-/// using sendfile on Linux for File -> socket.
+/// Copies exactly `len` bytes in chunks so progress can update.
 fn pump(mut r: impl Read, w: &mut impl Write, mut len: u64, done: &AtomicU64) -> io::Result<()> {
     while len > 0 {
         let n = io::copy(&mut r.by_ref().take(len.min(CHUNK)), w)?;
@@ -433,18 +581,27 @@ mod tests {
         fs::write(src.join("sub/b.txt"), "hi").unwrap();
         fs::create_dir_all(dst.join("Photos")).unwrap(); // existing folder -> must become "Photos (1)"
 
+        let (pc, phone) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let (pc_key, phone_key) = (pc.public, phone.public);
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let rx = std::thread::spawn(move || {
             let t = Transfer::new();
-            let clips = receive(l.accept().unwrap().0, &dst, &t, |o| o.from == "pc" && o.entries.len() == 5);
+            let clips = receive(l.accept().unwrap().0, &dst, &phone, &t, |o| o.from == "pc" && o.key == pc_key && o.entries.len() == 6);
             (clips, t.state())
         });
         let t = Transfer::new();
         let open = File::open(src.join("sub/b.txt")).unwrap();
         let img = File::open(src.join("sub/b.txt")).unwrap();
-        let items = vec![Item::Path(src.clone()), Item::Text("clip".into()), Item::Open(open, "../fd.txt".into()), Item::Image(img, "c.png".into())];
-        send(addr, "pc", items, &t);
+        let nested = File::open(src.join("sub/b.txt")).unwrap(); // Android folder send: fd + relative path
+        let items = vec![
+            Item::Path(src.clone()),
+            Item::Text("clip".into()),
+            Item::Open(open, "../fd.txt".into()),
+            Item::Image(img, "c.png".into()),
+            Item::Open(nested, "Album/sub/n.txt".into()),
+        ];
+        send(addr, "pc", &pc, Some(phone_key), items, &t);
         let (clips, rstate) = rx.join().unwrap();
         assert_eq!((t.state(), rstate), (State::Done, State::Done));
         assert_eq!(clips, [Clip::Text("clip".into()), Clip::Image(root.join("dst/c.png"))]);
@@ -452,11 +609,56 @@ mod tests {
         assert_eq!(fs::read(root.join("dst/Photos (1)/a.bin")).unwrap().len(), 9 << 20);
         assert_eq!(fs::read_to_string(root.join("dst/Photos (1)/sub/b.txt")).unwrap(), "hi");
         assert_eq!(fs::read_to_string(root.join("dst/.._fd.txt")).unwrap(), "hi"); // fd item, '/' neutralized
+        assert_eq!(fs::read_to_string(root.join("dst/Album/sub/n.txt")).unwrap(), "hi"); // safe path kept
 
         for evil in ["../x", "/etc/passwd", "a/../../x", "./a", ""] {
             assert!(!safe_rel(evil), "{evil}");
         }
         assert!(safe_rel("Photos/sub/b.txt"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn impostor_is_refused() {
+        let (pc, real, impostor) = (Identity::generate().unwrap(), Identity::generate().unwrap(), Identity::generate().unwrap());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let rx = std::thread::spawn(move || {
+            let t = Transfer::new();
+            let mut asked = false;
+            receive(l.accept().unwrap().0, Path::new("/nonexistent"), &impostor, &t, |_| {
+                asked = true;
+                true
+            });
+            asked
+        });
+        let t = Transfer::new();
+        send(addr, "pc", &pc, Some(real.public), vec![Item::Text("secret".into())], &t); // expects `real`
+        assert!(matches!(t.state(), State::Failed(e) if e.contains("couldn't prove")), "{:?}", t.state());
+        assert!(!rx.join().unwrap(), "the impostor never sees the offer");
+    }
+
+    #[test]
+    fn wire_is_encrypted() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let tx = std::thread::spawn(move || {
+            let sock = TcpStream::connect(addr).unwrap();
+            let mut s = Secure::connect(&sock, &Identity::generate().unwrap()).unwrap().0;
+            s.write_all(b"secret-marker").unwrap();
+            let mut back = [0; 2];
+            s.read_exact(&mut back).unwrap();
+            back
+        });
+        let (sock, _) = l.accept().unwrap();
+        let mut s = Secure::accept(&sock, &Identity::generate().unwrap()).unwrap().0;
+        let mut raw = [0; 2 + 13 + TAG]; // one frame, read straight off the socket
+        (&sock).read_exact(&mut raw).unwrap();
+        assert!(!raw.windows(13).any(|w| w == b"secret-marker"), "plaintext on the wire");
+        let mut out = [0; 64];
+        let n = s.noise.read_message(&raw[2..], &mut out).unwrap();
+        assert_eq!(&out[..n], b"secret-marker");
+        s.write_all(b"ok").unwrap();
+        assert_eq!(&tx.join().unwrap(), b"ok");
     }
 }

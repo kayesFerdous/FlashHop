@@ -7,8 +7,9 @@ object Core {
     }
 
     /** Returns null when the engine is running, or an error message. Call again to change name or
-     *  dir; [recent] (saved [recent] output) only seeds a new engine. */
-    external fun start(name: String, dir: String, recent: String): String?
+     *  dir; [recent] (saved [recent] output) and [state] (private folder for the device key and
+     *  trusted keys) only seed a new engine. */
+    external fun start(name: String, dir: String, recent: String, state: String): String?
     /** Recent device names, newest first, joined by U+001F. Save it after sending or accepting. */
     external fun recent(): String
     external fun setName(name: String)

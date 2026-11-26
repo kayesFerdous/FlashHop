@@ -24,6 +24,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.DocumentsContract.Document
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.SpannableStringBuilder
@@ -49,9 +50,12 @@ import android.window.OnBackInvokedDispatcher
 import java.io.File
 import kotlin.concurrent.thread
 
-/** A file (content uri) or text waiting to be sent. [image]: pasted from the clipboard, so it lands
- *  on the other device's clipboard too. */
-class Staged(val uri: Uri?, val text: String?, val label: String, val size: Long?, val image: Boolean = false)
+/** A file (content uri), folder or text waiting to be sent. [image]: pasted from the clipboard, so it
+ *  lands on the other device's clipboard too. [files]: a picked folder's files as (uri, "Folder/sub/name"). */
+class Staged(
+    val uri: Uri?, val text: String?, val label: String, val size: Long?, val image: Boolean = false,
+    val files: List<Pair<Uri, String>>? = null,
+)
 
 class MainActivity : Activity() {
     private val staged = ArrayList<Staged>()
@@ -148,7 +152,7 @@ class MainActivity : Activity() {
         window.insetsController?.setSystemBarsAppearance(light, light)
         window.isNavigationBarContrastEnforced = false
 
-        Core.start(name, dir.path, prefs.getString("recent", "")!!)?.let { errorView.text = it; errorView.visibility = View.VISIBLE }
+        Core.start(name, dir.path, prefs.getString("recent", "")!!, filesDir.path)?.let { errorView.text = it; errorView.visibility = View.VISIBLE }
         startWatcher(applicationContext)
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
@@ -210,12 +214,53 @@ class MainActivity : Activity() {
         startActivityForResult(i, PICK)
     }
 
+    private fun pickFolder() {
+        @Suppress("DEPRECATION")
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_FOLDER)
+    }
+
+    /** Lists the folder off the UI thread (big folders take a moment), then stages it as one item. */
+    private fun stageFolder(tree: Uri) = thread {
+        val root = DocumentsContract.getTreeDocumentId(tree)
+        val files = ArrayList<Triple<Uri, String, Long>>()
+        val name = runCatching {
+            val n = contentResolver.query(DocumentsContract.buildDocumentUriUsingTree(tree, root),
+                arrayOf(Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            cleanName(n ?: root.substringAfterLast('/').substringAfterLast(':')).also { walkTree(tree, root, it, files, 0) }
+        }
+        runOnUiThread {
+            name.onFailure { toast("Couldn't read that folder: ${it.message}") }.onSuccess {
+                if (files.isEmpty()) toast("That folder has no files")
+                else staged += Staged(tree, null, it, files.sumOf { f -> f.third }, files = files.map { f -> f.first to f.second })
+            }
+            render()
+        }
+    }
+
+    /** Every file under [docId] as (document uri, "path/name", size). Empty folders are skipped, like desktop. */
+    private fun walkTree(tree: Uri, docId: String, path: String, out: ArrayList<Triple<Uri, String, Long>>, depth: Int) {
+        if (depth > 32) return // a symlink loop would otherwise recurse forever
+        val cols = arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE, Document.COLUMN_SIZE)
+        contentResolver.query(DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId), cols, null, null, null)?.use { c ->
+            while (c.moveToNext()) {
+                val id = c.getString(0) ?: continue
+                val rel = path + "/" + cleanName(c.getString(1) ?: continue)
+                if (c.getString(2) == Document.MIME_TYPE_DIR) walkTree(tree, id, rel, out, depth + 1)
+                else out += Triple(DocumentsContract.buildDocumentUriUsingTree(tree, id), rel, if (c.isNull(3)) 0L else c.getLong(3))
+            }
+        }
+    }
+
+    /** One path component: no '/', never "." or "..". The receiver checks again; this keeps the folder intact. */
+    private fun cleanName(n: String) = n.replace('/', '_').let { if (it.isEmpty() || it == "." || it == "..") "_" else it }
+
     @Deprecated("Platform API; no AndroidX on purpose")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK || data == null) return
         if (requestCode == PICK_DIR) { data.data?.let { setDir(it) }; return }
+        if (requestCode == PICK_FOLDER) { data.data?.let { stageFolder(it) }; return }
         if (requestCode != PICK) return
         val clip = data.clipData
         if (clip != null) for (i in 0 until clip.itemCount) stageUri(clip.getItemAt(i).uri) else data.data?.let { stageUri(it) }
@@ -273,6 +318,11 @@ class MainActivity : Activity() {
         // Clipboard images go first: Core.send treats the first `images` fds as clipboard images.
         for (s in staged.sortedByDescending { it.image }) {
             if (s.text != null) { texts += s.text; continue }
+            if (s.files != null) {
+                for ((uri, rel) in s.files) runCatching { contentResolver.openFileDescriptor(uri, "r")!!.detachFd() }
+                    .onSuccess { fds += it; names += rel }.onFailure { toast("Skipped $rel: ${it.message}") }
+                continue
+            }
             val png = if (s.image) runCatching { pngFd(s.uri!!) }.getOrNull() else null
             if (png != null) { fds += png; names += s.label.substringBeforeLast('.') + ".png"; images++; continue }
             val fd = runCatching { contentResolver.openFileDescriptor(s.uri!!, "r")!!.detachFd() }
@@ -384,7 +434,7 @@ class MainActivity : Activity() {
         }
         dir = File(Environment.getExternalStorageDirectory(), rel)
         prefs.edit().putString("dir", dir.path).apply()
-        Core.start(nameView.text.toString(), dir.path, "") // running engine: just switches the folder
+        Core.start(nameView.text.toString(), dir.path, "", filesDir.path) // running engine: just switches the folder
         dirView?.text = shortDir()
         render()
     }
@@ -447,8 +497,8 @@ class MainActivity : Activity() {
         dockBox.removeAllViews()
         if (compact) {
             dockBox.addView(row(
-                round(Ic.Plus, "Pick files", 44, Tone.Lime) { pickFiles() },
-                pill("Files", Ic.File, Tone.Glass) { pickFiles() }.margins(l = dp(4)),
+                pill("Files", Ic.File, Tone.Glass) { pickFiles() },
+                pill("Folder", Ic.Folder, Tone.Glass) { pickFolder() }.margins(l = dp(8)),
                 pill("Paste", Ic.Paste, Tone.Glass) { paste() }.margins(l = dp(8)),
                 gravity = Gravity.CENTER,
             ))
@@ -465,6 +515,7 @@ class MainActivity : Activity() {
         }
         dockBox.addView(row(
             pill("Files", Ic.File, Tone.Glass) { pickFiles() },
+            pill("Folder", Ic.Folder, Tone.Glass) { pickFolder() }.margins(l = dp(8)),
             pill("Paste", Ic.Paste, Tone.Glass) { paste() }.margins(l = dp(8)),
             gravity = Gravity.CENTER,
         ).apply { layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT) })
@@ -478,7 +529,7 @@ class MainActivity : Activity() {
         for (s in staged.take(MAX_ROWS)) {
             val size = s.size?.let { human(it) } ?: ""
             top.addView(row(
-                glyph(if (s.text != null) Ic.Text else Ic.File, C.MUTED, 20),
+                glyph(if (s.text != null) Ic.Text else if (s.files != null) Ic.Folder else Ic.File, C.MUTED, 20),
                 tv(s.label, 15f, 500, C.INK).weight1().margins(l = dp(10), r = dp(8)),
                 tv(size, 13f, 400, C.MUTED),
                 round(Ic.Close, "Remove ${s.label}", 40, Tone.Ground) { staged.remove(s); render() }.margins(l = dp(4)),
@@ -575,6 +626,7 @@ class MainActivity : Activity() {
     companion object {
         private const val PICK = 1
         private const val PICK_DIR = 2
+        private const val PICK_FOLDER = 3
         /** The device search shows from this many devices on. Mirrored in desktop main.rs. */
         private const val FIND_FROM = 5
         private const val MAX_ROWS = 6

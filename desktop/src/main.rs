@@ -102,7 +102,7 @@ fn main() -> eframe::Result {
         opts,
         Box::new(|cc| {
             ui::setup(&cc.egui_ctx);
-            let e = Engine::start(name, dir).map_err(|e| format!("Network error: {e} (is it already running?)"))?;
+            let e = Engine::start(name, dir, home().join(".config/flashhop")).map_err(|e| format!("Network error: {e} (is it already running?)"))?;
             *e.recent.lock().unwrap() = recent;
             watch(e.clone(), cc.egui_ctx.clone());
             Ok(Box::new(App {
