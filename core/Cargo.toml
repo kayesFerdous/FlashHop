@@ -1,7 +1,9 @@
 [package]
 name = "flashhop_core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
-# No dependencies: protocol + engine on std only. Shared by desktop and Android.
+# Protocol + engine. Shared by desktop and Android. The one dependency is the Noise protocol
+# (pure-Rust ChaCha20-Poly1305 / X25519 / BLAKE2s, no C code) that encrypts every transfer.
 [dependencies]
+snow = { version = "0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }

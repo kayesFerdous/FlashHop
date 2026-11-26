@@ -56,16 +56,17 @@ All versions are on the [releases page](https://github.com/kayesFerdous/FlashHop
 
 ## Why FlashHop
 
-- **Fast.** Bytes go straight from one device to the other over TCP, with zero-copy `sendfile` on Linux and Android. No server in the middle.
+- **Fast.** Bytes go straight from one device to the other over TCP. No server in the middle.
+- **Encrypted and verified.** Every transfer uses fresh keys (Noise protocol, ChaCha20-Poly1305), so others on the Wi‑Fi can't read what you send. Each device also has a permanent key: once two devices have talked, an impostor using the same name gets flagged and refused.
 - **Private.** Nothing leaves your router. There's no sign-up and no telemetry.
 - **Paste anything.** Press Ctrl+V (Cmd+V on a Mac) to send copied files, screenshots, or text. Text and images land on the other device's clipboard.
-- **Small.** The desktop app is a single ~9 MB binary, and the APK is ~1 MB.
+- **Small.** The desktop app is a single ~10 MB binary, and the APK is ~1 MB.
 - **One engine.** Every app runs the same Rust core, so they behave identically.
 
 ## How to use
 
 1. Open FlashHop on both devices. They find each other within a couple of seconds.
-2. **Desktop:** drop files or folders on the window, use **Files…** / **Folder…**, or paste. **Android:** tap **Share → FlashHop** in any app, or use **Files** / **Paste**.
+2. **Desktop:** drop files or folders on the window, use **Files…** / **Folder…**, or paste. **Android:** tap **Share → FlashHop** in any app, or use **Files** / **Folder** / **Paste**.
 3. Tap the lime arrow next to a device. The receiver gets a notification and taps **Accept**.
 
 Files land in `~/Downloads` (desktop) or `Download/FlashHop` (Android). You can change either in Settings.
@@ -105,14 +106,15 @@ cargo run --release -p flashhop_core --example peer -- send 192.168.1.50:47821 .
 
 ```
 core/            shared Rust engine: wire protocol (net.rs), discovery, offers, transfers,
-                 progress, file naming, every message text. No dependencies.
+                 progress, file naming, every message text, encryption.
 desktop/         egui window (Linux, macOS, Windows)
 android/rust/    thin JNI bridge
 android/src/     Kotlin screens, plain Android widgets
 ```
 
 - **Discovery:** every 2 seconds, each device broadcasts its name over UDP, and devices that hear it reply directly.
-- **Transfer:** one TCP connection per send: a header, then accept/decline, then raw bytes.
+- **Transfer:** one TCP connection per send. A Noise XX handshake proves both devices' permanent keys and sets up fresh session keys, then a header, accept/decline, and the file bytes, all encrypted.
+- **Trust:** like SSH, the first transfer with a device remembers its key. Later, a device using a known name with a different key shows **Not verified**, sends to it are refused, and its offers carry a warning (accept one if it was really reinstalled).
 - **Safety:** every incoming path is checked, so a sender can't write outside your downloads folder. The protocol is versioned, so mismatched builds refuse each other instead of corrupting files.
 
 </details>
@@ -121,8 +123,8 @@ android/src/     Kotlin screens, plain Android widgets
 <summary><b>Not done yet</b></summary>
 <br>
 
-- **No encryption.** That's fine on a home network but not on public Wi‑Fi. TLS with a pairing code is next.
-- Android receives only while the app is open, and sends files but not whole folders.
+- **The first contact isn't verified.** Trust starts at the first transfer (as with SSH), with no code to compare.
+- Android receives only while the app is open.
 - Empty folders aren't sent. There's no tray icon and no auto-accept for trusted devices.
 
 </details>

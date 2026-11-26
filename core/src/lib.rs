@@ -7,9 +7,9 @@ use net::{Clip, Item, State, Transfer};
 use std::{
     collections::HashMap,
     hash::{BuildHasher, RandomState},
-    io,
+    fs, io,
     net::{IpAddr, SocketAddr, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -25,12 +25,30 @@ pub struct Peer {
     pub ip: IpAddr,
     /// Sent to or accepted from lately; these sort first.
     pub recent: bool,
+    pub trust: Trust,
+}
+
+/// What this device knows about a peer's key (trust on first use, pinned per device name).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Trust {
+    /// Never exchanged anything with a device of this name.
+    New,
+    /// Same key as every earlier transfer.
+    Verified,
+    /// A device of this name is known, but with a different key: reinstalled, a second device
+    /// with the same name, or an impostor. Sending to it is refused until it is accepted once.
+    Changed,
 }
 
 impl Peer {
     /// The line under the name in both UIs.
     pub fn detail(&self) -> String {
-        if self.recent { format!("Recent · {}", self.ip) } else { self.ip.to_string() }
+        match self.trust {
+            Trust::Changed => format!("Not verified: new key · {}", self.ip),
+            Trust::Verified => format!("Verified · {}", self.ip),
+            Trust::New if self.recent => format!("Recent · {}", self.ip),
+            Trust::New => self.ip.to_string(),
+        }
     }
 }
 
@@ -77,6 +95,7 @@ impl Job {
 struct Pending {
     offer: Offer,
     from: String,
+    key: [u8; 32],
     reply: mpsc::Sender<bool>,
     job: Job,
 }
@@ -86,6 +105,10 @@ pub struct Engine {
     pub dir: Mutex<PathBuf>,
     /// Names of devices sent to or accepted from, newest first. Platforms persist it.
     pub recent: Mutex<Vec<String>>,
+    me: net::Identity,
+    /// (device name, key) pairs seen in completed or accepted transfers; saved in `state/known`.
+    known: Mutex<Vec<(String, [u8; 32])>>,
+    state: PathBuf,
     peers: Mutex<HashMap<u64, net::Peer>>,
     pending: Mutex<Vec<Pending>>,
     jobs: Mutex<Vec<Job>>,
@@ -97,12 +120,18 @@ pub struct Engine {
 
 impl Engine {
     /// Binds the port and starts discovery + the receiver. Fails if another copy is running.
-    pub fn start(name: String, dir: PathBuf) -> io::Result<Arc<Self>> {
+    /// `state` is a private folder for this device's key (`identity`) and trusted keys (`known`).
+    pub fn start(name: String, dir: PathBuf, state: PathBuf) -> io::Result<Arc<Self>> {
         let (udp, tcp) = (net::discovery_socket()?, net::listen()?);
+        fs::create_dir_all(&state)?;
+        let me = net::Identity::load_or_create(&state.join("identity"))?;
         let e = Arc::new(Self {
             name: Mutex::new(name),
             dir: Mutex::new(dir),
             recent: Default::default(),
+            me,
+            known: Mutex::new(load_known(&state.join("known"))),
+            state,
             peers: Default::default(),
             pending: Default::default(),
             jobs: Default::default(),
@@ -113,7 +142,7 @@ impl Engine {
         });
         let id = RandomState::new().hash_one(std::process::id());
         let e2 = e.clone();
-        thread::spawn(move || net::discovery(udp, id, &e2.name, &e2.peers, || e2.changed()));
+        thread::spawn(move || net::discovery(udp, id, e2.me.public, &e2.name, &e2.peers, || e2.changed()));
         let e2 = e.clone();
         thread::spawn(move || {
             for conn in tcp.incoming().flatten() {
@@ -127,11 +156,15 @@ impl Engine {
     fn receive(&self, conn: TcpStream) {
         let t = Arc::new(Transfer::new());
         let dir = self.dir.lock().unwrap().clone();
-        let clips = net::receive(conn, &dir, &t, |o| {
+        let clips = net::receive(conn, &dir, &self.me, &t, |o| {
             let (reply, decision) = mpsc::channel();
-            let offer = Offer { id: self.next_id(), summary: summarize(o) };
+            let mut summary = summarize(o);
+            if self.trust(&o.from, &o.key) == Trust::Changed {
+                summary += &format!(". This isn't the {} you used before; accept only if it's new or reinstalled.", o.from);
+            }
+            let offer = Offer { id: self.next_id(), summary };
             let job = Job { id: self.next_id(), label: format!("From {}", o.from), incoming: true, t: t.clone() };
-            self.pending.lock().unwrap().push(Pending { offer, from: o.from.clone(), reply, job });
+            self.pending.lock().unwrap().push(Pending { offer, from: o.from.clone(), key: o.key, reply, job });
             self.changed();
             decision.recv().unwrap_or(false)
         });
@@ -141,14 +174,22 @@ impl Engine {
     }
 
     pub fn send(self: &Arc<Self>, peer: u64, items: Vec<Item>) {
-        let Some((name, ip)) = self.peers.lock().unwrap().get(&peer).map(|p| (p.name.clone(), p.ip)) else { return };
-        self.touch(&name);
+        let Some((name, ip, key)) = self.peers.lock().unwrap().get(&peer).map(|p| (p.name.clone(), p.ip, p.key)) else { return };
         let t = Arc::new(Transfer::new());
         self.jobs.lock().unwrap().push(Job { id: self.next_id(), label: format!("To {name}"), incoming: false, t: t.clone() });
+        if self.trust(&name, &key) == Trust::Changed {
+            // The offer card on the other side explains; here one short line has to fit a phone.
+            t.end::<()>(Err(io::Error::other("Not sent: unrecognized key. Accept a send from it first.")));
+            return self.changed();
+        }
+        self.touch(&name);
         let (e, me) = (self.clone(), self.name.lock().unwrap().clone());
         thread::spawn(move || {
-            net::send(SocketAddr::new(ip, net::PORT), &me, items, &t);
+            net::send(SocketAddr::new(ip, net::PORT), &me, &e.me, Some(key), items, &t);
             log_end(&format!("send to {name} ({ip})"), &t);
+            if t.state() == State::Done {
+                e.pin(&name, key);
+            }
             e.changed();
         });
         self.changed();
@@ -160,6 +201,7 @@ impl Engine {
             let p = pending.remove(i);
             if accept {
                 self.touch(&p.from);
+                self.pin(&p.from, p.key);
                 self.jobs.lock().unwrap().push(p.job);
             }
             let _ = p.reply.send(accept);
@@ -181,8 +223,29 @@ impl Engine {
 
     /// Recent devices first (newest first), then by name.
     pub fn peers(&self) -> Vec<Peer> {
-        let all = self.peers.lock().unwrap().iter().map(|(&id, p)| Peer { id, name: p.name.clone(), ip: p.ip, recent: false }).collect();
+        let all = self.peers.lock().unwrap().iter()
+            .map(|(&id, p)| Peer { id, name: p.name.clone(), ip: p.ip, recent: false, trust: self.trust(&p.name, &p.key) })
+            .collect();
         by_recent(all, &self.recent.lock().unwrap())
+    }
+
+    /// This device's public key (what discovery announces).
+    pub fn key(&self) -> [u8; 32] {
+        self.me.public
+    }
+
+    fn trust(&self, name: &str, key: &[u8; 32]) -> Trust {
+        trust(&self.known.lock().unwrap(), name, key)
+    }
+
+    /// Remembers `key` for `name` (several keys per name are fine: two phones called "Pixel 8a").
+    fn pin(&self, name: &str, key: [u8; 32]) {
+        let mut known = self.known.lock().unwrap();
+        if trust(&known, name, &key) != Trust::Verified {
+            known.push((name.to_owned(), key));
+            let txt: String = known.iter().map(|(n, k)| format!("{} {}\n", hex(k), n.replace('\n', " "))).collect();
+            let _ = fs::write(self.state.join("known"), txt);
+        }
     }
 
     fn touch(&self, name: &str) {
@@ -221,6 +284,32 @@ impl Engine {
     fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Relaxed)
     }
+}
+
+fn trust(known: &[(String, [u8; 32])], name: &str, key: &[u8; 32]) -> Trust {
+    if known.iter().any(|(n, k)| n == name && k == key) {
+        Trust::Verified
+    } else if known.iter().any(|(n, _)| n == name) {
+        Trust::Changed
+    } else {
+        Trust::New
+    }
+}
+
+/// `known` file: one `<64 hex digits> <device name>` line per trusted key.
+fn load_known(path: &Path) -> Vec<(String, [u8; 32])> {
+    let txt = fs::read_to_string(path).unwrap_or_default();
+    txt.lines()
+        .filter_map(|l| {
+            let (k, name) = l.split_once(' ')?;
+            let b: Vec<u8> = (0..k.len()).step_by(2).map(|i| u8::from_str_radix(k.get(i..i + 2)?, 16).ok()).collect::<Option<_>>()?;
+            Some((name.to_owned(), b.try_into().ok()?))
+        })
+        .collect()
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn push_recent(r: &mut Vec<String>, name: &str) {
@@ -278,9 +367,23 @@ mod tests {
             super::push_recent(&mut recent, n);
         }
         assert_eq!(recent, ["f", "e", "d", "c", "b"], "newest first, no repeats, capped");
-        let peer = |name: &str| super::Peer { id: 0, name: name.into(), ip: [10, 0, 0, 1].into(), recent: false };
+        let peer = |name: &str| super::Peer { id: 0, name: name.into(), ip: [10, 0, 0, 1].into(), recent: false, trust: super::Trust::New };
         let v = super::by_recent(vec![peer("z"), peer("c"), peer("a"), peer("f")], &recent);
         let got: Vec<_> = v.iter().map(|p| (p.name.as_str(), p.recent)).collect();
         assert_eq!(got, [("f", true), ("c", true), ("a", false), ("z", false)]);
+    }
+
+    #[test]
+    fn trust_on_first_use() {
+        use super::Trust::*;
+        let path = std::env::temp_dir().join(format!("flashhop-known-{}", std::process::id()));
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        std::fs::write(&path, format!("{} Pixel 8a\ngarbage line\n", super::hex(&a))).unwrap();
+        let known = super::load_known(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(known, [("Pixel 8a".to_string(), a)], "hex round trip, bad lines skipped");
+        assert_eq!(super::trust(&known, "Pixel 8a", &a), Verified);
+        assert_eq!(super::trust(&known, "Pixel 8a", &b), Changed);
+        assert_eq!(super::trust(&known, "Laptop", &b), New);
     }
 }

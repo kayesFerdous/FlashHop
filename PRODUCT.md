@@ -18,7 +18,7 @@ Send anything to a nearby device without a cloud, an account, or a cable. Succes
 
 ## Positioning
 
-Direct device-to-device over the LAN: no server, no sign-in, no upload limit, zero-copy `sendfile` speed. One shared engine, so desktop and Android behave and word things identically. Small binary, near-zero idle cost.
+Direct device-to-device over the LAN: no server, no sign-in, no upload limit, encrypted, full LAN speed. One shared engine, so desktop and Android behave and word things identically. Small binary, near-zero idle cost.
 
 ## Operating Context
 
@@ -28,7 +28,7 @@ Direct device-to-device over the LAN: no server, no sign-in, no upload limit, ze
 
 ## Capabilities and Constraints
 
-- Items: files, folders (desktop), text (≤16 MB, lands in the receiver's clipboard), pasted images (re-encoded to PNG; saved like a file and also put on the receiver's clipboard).
+- Items: files, folders, text (≤16 MB, lands in the receiver's clipboard), pasted images (re-encoded to PNG; saved like a file and also put on the receiver's clipboard).
 - States: searching for devices, devices found, staged items, incoming offer (accept/decline), transfer waiting/running (bytes, speed)/done/failed, cancel.
 - All user-visible wording for offers and job status comes from `core` (`summarize()`, `Job::status()`, `human()`); UIs must not diverge.
 - Binary size and idle cost are priorities. Desktop embeds one variable UI font (Inter) in place of egui's bundled fonts; no other new dependencies.

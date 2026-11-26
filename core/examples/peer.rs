@@ -8,7 +8,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match (args.first().map(String::as_str), args.get(1)) {
         (Some("recv"), Some(dir)) => {
-            let e = Engine::start("test-peer".into(), dir.into()).expect("port 47821 busy?");
+            let e = Engine::start("test-peer".into(), dir.into(), state()).expect("port 47821 busy?");
+            println!("key: {}", e.key().iter().map(|b| format!("{b:02x}")).collect::<String>()); // for hand-made announces
             let (mut seen, mut printed) = (0, HashSet::new());
             loop {
                 seen = e.wait(seen, Duration::from_secs(1));
@@ -38,9 +39,17 @@ fn main() {
                     }
                 })
                 .collect();
-            net::send(addr.parse().expect("ip:port"), "test-peer", items, &t);
+            let id = net::Identity::load_or_create(&state().join("identity")).expect("identity");
+            net::send(addr.parse().expect("ip:port"), "test-peer", &id, None, items, &t); // any receiver key
             println!("{:?}, {} at {}/s", t.state(), human(t.done.load(std::sync::atomic::Ordering::Relaxed)), human(t.speed() as u64));
         }
         _ => eprintln!("usage: peer recv <dir> | peer send <ip:port> <path>|text:<s>|image:<png>..."),
     }
+}
+
+/// The test peer's own key and trusted devices, kept between runs like an app's.
+fn state() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join("flashhop-peer");
+    std::fs::create_dir_all(&p).expect("state dir");
+    p
 }
