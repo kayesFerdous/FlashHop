@@ -2,7 +2,8 @@
 //! Wire format is shared by every platform: change it here, bump MAGIC, and both apps follow.
 //!
 //! Discovery packet: MAGIC | id u64 | kind u8 (0 announce, 1 reply) | name utf8
-//! Transfer: sender -> MAGIC | name | count u32 | count * (is_text u8, path, size u64)
+//! Transfer: sender -> MAGIC | name | count u32 | count * (kind u8, path, size u64)
+//!           kind: 0 file, 1 text, 2 clipboard image (a PNG file; older builds just save it)
 //!           receiver -> 1 (accept) / 0 (decline)
 //!           sender -> raw bytes of every entry, in order
 //!           receiver -> 1 (all saved)
@@ -35,6 +36,17 @@ pub enum Item {
     /// Already-open file plus its display name (Android hands out fds, not paths).
     Open(File, String),
     Text(String),
+    /// Clipboard image: an open PNG plus its name. Saved like a file, and also put on the
+    /// receiver's clipboard.
+    Image(File, String),
+}
+
+/// What a transfer hands the receiver's clipboard.
+#[derive(Debug, PartialEq)]
+pub enum Clip {
+    Text(String),
+    /// A received clipboard image (PNG), already saved at this path.
+    Image(PathBuf),
 }
 
 pub struct Peer {
@@ -52,6 +64,7 @@ pub fn discovery_socket() -> io::Result<UdpSocket> {
 
 pub struct Entry {
     pub text: bool,
+    pub image: bool,
     pub name: String,
     pub size: u64,
 }
@@ -132,7 +145,7 @@ impl Transfer {
 fn describe(e: &io::Error) -> String {
     use io::ErrorKind::*;
     match e.kind() {
-        ConnectionRefused => "Couldn't connect. Is Akhri Pasta open on the other device?".into(),
+        ConnectionRefused => "Couldn't connect. Is FlashHop open on the other device?".into(),
         TimedOut | WouldBlock => "Timed out. Are both devices on the same network?".into(),
         HostUnreachable | NetworkUnreachable | AddrNotAvailable => "Can't reach that device from this network.".into(),
         ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof => "Stopped: the connection closed.".into(),
@@ -201,12 +214,13 @@ enum Src {
 fn expand(items: Vec<Item>) -> io::Result<Vec<(Entry, Src)>> {
     let mut out = vec![];
     for it in items {
+        let image = matches!(it, Item::Image(..));
         match it {
-            Item::Text(t) => out.push((Entry { text: true, name: String::new(), size: t.len() as u64 }, Src::Text(t))),
-            Item::Open(f, name) => {
+            Item::Text(t) => out.push((Entry { text: true, image: false, name: String::new(), size: t.len() as u64 }, Src::Text(t))),
+            Item::Open(f, name) | Item::Image(f, name) => {
                 let size = f.metadata()?.len();
                 let name = if name.is_empty() { "file".into() } else { name.replace('/', "_") };
-                out.push((Entry { text: false, name, size }, Src::Open(f)));
+                out.push((Entry { text: false, image, name, size }, Src::Open(f)));
             }
             Item::Path(p) => {
                 let name = p.file_name().map_or("item".into(), |n| n.to_string_lossy().into_owned());
@@ -229,7 +243,7 @@ fn walk(p: &Path, name: String, out: &mut Vec<(Entry, Src)>) -> io::Result<()> {
             walk(&e.path(), format!("{name}/{}", e.file_name().to_string_lossy()), out)?;
         }
     } else if meta.is_file() {
-        out.push((Entry { text: false, name, size: meta.len() }, Src::File(p.into())));
+        out.push((Entry { text: false, image: false, name, size: meta.len() }, Src::File(p.into())));
     }
     Ok(())
 }
@@ -248,7 +262,7 @@ fn send_inner(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) -> io:
     put_str(&mut w, me)?;
     w.write_all(&u32::try_from(entries.len()).map_err(|_| bad("too many files"))?.to_le_bytes())?;
     for (e, _) in &entries {
-        w.write_all(&[e.text as u8])?;
+        w.write_all(&[if e.text { 1 } else if e.image { 2 } else { 0 }])?;
         put_str(&mut w, &e.name)?;
         w.write_all(&e.size.to_le_bytes())?;
     }
@@ -279,23 +293,24 @@ fn send_inner(addr: SocketAddr, me: &str, items: Vec<Item>, t: &Transfer) -> io:
 // ---------- receive ----------
 
 /// Reads the offer, asks `ask` (blocks until the user decides), then saves into `dir`.
-/// Returns received text snippets.
-pub fn receive(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> Vec<String> {
+/// Returns what goes on the clipboard: received texts and clipboard images.
+pub fn receive(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> Vec<Clip> {
     t.end(receive_inner(sock, dir, t, ask)).unwrap_or_default()
 }
 
-fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> io::Result<Vec<String>> {
+fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> io::Result<Vec<Clip>> {
     *t.sock.lock().unwrap() = Some(sock.try_clone()?);
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut r = BufReader::with_capacity(BUF, &sock);
     if &get::<4>(&mut r)? != MAGIC {
-        return Err(bad("not an akhri_pasta sender"));
+        return Err(bad("not an flashhop sender"));
     }
     let from = get_str(&mut r)?;
     let n = u32::from_le_bytes(get(&mut r)?);
     let mut entries = vec![];
     for _ in 0..n {
-        let e = Entry { text: get::<1>(&mut r)? == [1], name: get_str(&mut r)?, size: u64::from_le_bytes(get(&mut r)?) };
+        let kind = get::<1>(&mut r)?[0];
+        let e = Entry { text: kind == 1, image: kind == 2, name: get_str(&mut r)?, size: u64::from_le_bytes(get(&mut r)?) };
         // Trust boundary: names come from the network.
         if e.text && e.size > MAX_TEXT || !e.text && !safe_rel(&e.name) {
             return Err(bad("rejected unsafe entry"));
@@ -313,13 +328,13 @@ fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Of
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
     fs::create_dir_all(dir)?;
 
-    let mut texts = vec![];
+    let mut clips = vec![];
     let mut tops: HashMap<String, PathBuf> = HashMap::new(); // incoming folder -> unique local folder
     for e in &offer.entries {
         if e.text {
             let mut b = vec![0; e.size as usize];
             r.read_exact(&mut b)?;
-            texts.push(String::from_utf8_lossy(&b).into_owned());
+            clips.push(Clip::Text(String::from_utf8_lossy(&b).into_owned()));
             t.done.fetch_add(e.size, Relaxed);
             continue;
         }
@@ -340,9 +355,12 @@ fn receive_inner(sock: TcpStream, dir: &Path, t: &Transfer, ask: impl FnOnce(&Of
             let _ = fs::remove_file(&path); // no half-written files left behind
             return Err(err);
         }
+        if e.image {
+            clips.push(Clip::Image(path));
+        }
     }
     (&sock).write_all(&[1])?;
-    Ok(texts)
+    Ok(clips)
 }
 
 /// Only plain relative paths: no `..`, no root, no `.`.
@@ -408,7 +426,7 @@ mod tests {
 
     #[test]
     fn folder_text_and_unsafe_names() {
-        let root = std::env::temp_dir().join(format!("akp-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("flashhop-test-{}", std::process::id()));
         let (src, dst) = (root.join("src/Photos"), root.join("dst"));
         fs::create_dir_all(src.join("sub")).unwrap();
         fs::write(src.join("a.bin"), vec![7u8; 9 << 20]).unwrap(); // > CHUNK, exercises the loop
@@ -419,15 +437,18 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let rx = std::thread::spawn(move || {
             let t = Transfer::new();
-            let texts = receive(l.accept().unwrap().0, &dst, &t, |o| o.from == "pc" && o.entries.len() == 4);
-            (texts, t.state())
+            let clips = receive(l.accept().unwrap().0, &dst, &t, |o| o.from == "pc" && o.entries.len() == 5);
+            (clips, t.state())
         });
         let t = Transfer::new();
         let open = File::open(src.join("sub/b.txt")).unwrap();
-        send(addr, "pc", vec![Item::Path(src.clone()), Item::Text("clip".into()), Item::Open(open, "../fd.txt".into())], &t);
-        let (texts, rstate) = rx.join().unwrap();
+        let img = File::open(src.join("sub/b.txt")).unwrap();
+        let items = vec![Item::Path(src.clone()), Item::Text("clip".into()), Item::Open(open, "../fd.txt".into()), Item::Image(img, "c.png".into())];
+        send(addr, "pc", items, &t);
+        let (clips, rstate) = rx.join().unwrap();
         assert_eq!((t.state(), rstate), (State::Done, State::Done));
-        assert_eq!(texts, ["clip"]);
+        assert_eq!(clips, [Clip::Text("clip".into()), Clip::Image(root.join("dst/c.png"))]);
+        assert_eq!(fs::read_to_string(root.join("dst/c.png")).unwrap(), "hi"); // image is saved too
         assert_eq!(fs::read(root.join("dst/Photos (1)/a.bin")).unwrap().len(), 9 << 20);
         assert_eq!(fs::read_to_string(root.join("dst/Photos (1)/sub/b.txt")).unwrap(), "hi");
         assert_eq!(fs::read_to_string(root.join("dst/.._fd.txt")).unwrap(), "hi"); // fd item, '/' neutralized

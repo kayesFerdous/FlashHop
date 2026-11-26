@@ -3,7 +3,7 @@
 
 pub mod net;
 
-use net::{Item, State, Transfer};
+use net::{Clip, Item, State, Transfer};
 use std::{
     collections::HashMap,
     hash::{BuildHasher, RandomState},
@@ -23,7 +23,19 @@ pub struct Peer {
     pub id: u64,
     pub name: String,
     pub ip: IpAddr,
+    /// Sent to or accepted from lately; these sort first.
+    pub recent: bool,
 }
+
+impl Peer {
+    /// The line under the name in both UIs.
+    pub fn detail(&self) -> String {
+        if self.recent { format!("Recent · {}", self.ip) } else { self.ip.to_string() }
+    }
+}
+
+/// How many recent device names `Engine::recent` keeps.
+const RECENT: usize = 5;
 
 #[derive(Clone)]
 pub struct Offer {
@@ -64,6 +76,7 @@ impl Job {
 
 struct Pending {
     offer: Offer,
+    from: String,
     reply: mpsc::Sender<bool>,
     job: Job,
 }
@@ -71,10 +84,12 @@ struct Pending {
 pub struct Engine {
     pub name: Mutex<String>,
     pub dir: Mutex<PathBuf>,
+    /// Names of devices sent to or accepted from, newest first. Platforms persist it.
+    pub recent: Mutex<Vec<String>>,
     peers: Mutex<HashMap<u64, net::Peer>>,
     pending: Mutex<Vec<Pending>>,
     jobs: Mutex<Vec<Job>>,
-    texts: Mutex<Vec<String>>,
+    clips: Mutex<Vec<Clip>>,
     generation: Mutex<u64>,
     cv: Condvar,
     ids: AtomicU64,
@@ -87,10 +102,11 @@ impl Engine {
         let e = Arc::new(Self {
             name: Mutex::new(name),
             dir: Mutex::new(dir),
+            recent: Default::default(),
             peers: Default::default(),
             pending: Default::default(),
             jobs: Default::default(),
-            texts: Default::default(),
+            clips: Default::default(),
             generation: Mutex::new(0),
             cv: Condvar::new(),
             ids: AtomicU64::new(1),
@@ -111,21 +127,22 @@ impl Engine {
     fn receive(&self, conn: TcpStream) {
         let t = Arc::new(Transfer::new());
         let dir = self.dir.lock().unwrap().clone();
-        let texts = net::receive(conn, &dir, &t, |o| {
+        let clips = net::receive(conn, &dir, &t, |o| {
             let (reply, decision) = mpsc::channel();
             let offer = Offer { id: self.next_id(), summary: summarize(o) };
             let job = Job { id: self.next_id(), label: format!("From {}", o.from), incoming: true, t: t.clone() };
-            self.pending.lock().unwrap().push(Pending { offer, reply, job });
+            self.pending.lock().unwrap().push(Pending { offer, from: o.from.clone(), reply, job });
             self.changed();
             decision.recv().unwrap_or(false)
         });
         log_end("receive", &t);
-        self.texts.lock().unwrap().extend(texts);
+        self.clips.lock().unwrap().extend(clips);
         self.changed();
     }
 
     pub fn send(self: &Arc<Self>, peer: u64, items: Vec<Item>) {
         let Some((name, ip)) = self.peers.lock().unwrap().get(&peer).map(|p| (p.name.clone(), p.ip)) else { return };
+        self.touch(&name);
         let t = Arc::new(Transfer::new());
         self.jobs.lock().unwrap().push(Job { id: self.next_id(), label: format!("To {name}"), incoming: false, t: t.clone() });
         let (e, me) = (self.clone(), self.name.lock().unwrap().clone());
@@ -142,6 +159,7 @@ impl Engine {
         if let Some(i) = pending.iter().position(|p| p.offer.id == offer) {
             let p = pending.remove(i);
             if accept {
+                self.touch(&p.from);
                 self.jobs.lock().unwrap().push(p.job);
             }
             let _ = p.reply.send(accept);
@@ -161,10 +179,14 @@ impl Engine {
         self.changed();
     }
 
+    /// Recent devices first (newest first), then by name.
     pub fn peers(&self) -> Vec<Peer> {
-        let mut v: Vec<_> = self.peers.lock().unwrap().iter().map(|(&id, p)| Peer { id, name: p.name.clone(), ip: p.ip }).collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
+        let all = self.peers.lock().unwrap().iter().map(|(&id, p)| Peer { id, name: p.name.clone(), ip: p.ip, recent: false }).collect();
+        by_recent(all, &self.recent.lock().unwrap())
+    }
+
+    fn touch(&self, name: &str) {
+        push_recent(&mut self.recent.lock().unwrap(), name);
     }
 
     pub fn offers(&self) -> Vec<Offer> {
@@ -180,9 +202,9 @@ impl Engine {
         self.jobs.lock().unwrap().iter().any(Job::active)
     }
 
-    /// Received text snippets, handed over once so the UI can put them on the clipboard.
-    pub fn take_texts(&self) -> Vec<String> {
-        std::mem::take(&mut self.texts.lock().unwrap())
+    /// Received texts and clipboard images, handed over once so the UI can put them on the clipboard.
+    pub fn take_clips(&self) -> Vec<Clip> {
+        std::mem::take(&mut self.clips.lock().unwrap())
     }
 
     pub fn changed(&self) {
@@ -201,9 +223,24 @@ impl Engine {
     }
 }
 
+fn push_recent(r: &mut Vec<String>, name: &str) {
+    r.retain(|n| n != name);
+    r.insert(0, name.to_owned());
+    r.truncate(RECENT);
+}
+
+fn by_recent(mut v: Vec<Peer>, recent: &[String]) -> Vec<Peer> {
+    let rank = |name: &str| recent.iter().position(|r| r == name).unwrap_or(usize::MAX);
+    for p in &mut v {
+        p.recent = rank(&p.name) != usize::MAX;
+    }
+    v.sort_by(|a, b| (rank(&a.name), &a.name).cmp(&(rank(&b.name), &b.name)));
+    v
+}
+
 pub fn summarize(o: &net::Offer) -> String {
     let total: u64 = o.entries.iter().map(|e| e.size).sum();
-    let mut names: Vec<&str> = o.entries.iter().map(|e| if e.text { "text" } else { e.name.split('/').next().unwrap() }).collect();
+    let mut names: Vec<&str> = o.entries.iter().map(|e| if e.text { "text" } else if e.image { "image" } else { e.name.split('/').next().unwrap() }).collect();
     names.dedup();
     let more = if names.len() > 3 { format!(" +{} more", names.len() - 3) } else { String::new() };
     names.truncate(3);
@@ -230,4 +267,20 @@ pub fn human(b: u64) -> String {
 
 fn log_end(what: &str, t: &Transfer) {
     eprintln!("{what}: {:?}, {} at {}/s", t.state(), human(t.done.load(Relaxed)), human(t.speed() as u64));
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn recent_devices_sort_first() {
+        let mut recent = vec![];
+        for n in ["b", "a", "b", "c", "d", "e", "f"] {
+            super::push_recent(&mut recent, n);
+        }
+        assert_eq!(recent, ["f", "e", "d", "c", "b"], "newest first, no repeats, capped");
+        let peer = |name: &str| super::Peer { id: 0, name: name.into(), ip: [10, 0, 0, 1].into(), recent: false };
+        let v = super::by_recent(vec![peer("z"), peer("c"), peer("a"), peer("f")], &recent);
+        let got: Vec<_> = v.iter().map(|p| (p.name.as_str(), p.recent)).collect();
+        assert_eq!(got, [("f", true), ("c", true), ("a", false), ("z", false)]);
+    }
 }

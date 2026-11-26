@@ -1,8 +1,8 @@
 #!/bin/sh
-# One-time: installs the Rust Android toolchain and kotlinc into ~/.local/share/akhri-android.
+# One-time: installs the Rust Android toolchain and kotlinc into ~/.local/share/flashhop-android.
 # Separate RUSTUP_HOME/CARGO_HOME, nothing added to PATH: your normal Rust setup is untouched.
 set -eu
-TOOLS=${AKHRI_TOOLS:-$HOME/.local/share/akhri-android}
+TOOLS=${FLASHHOP_TOOLS:-$HOME/.local/share/flashhop-android}
 RUST=1.100.0 # keep equal to the desktop rustc so both apps build from the same compiler
 KOTLIN=2.4.21
 mkdir -p "$TOOLS" && cd "$TOOLS"

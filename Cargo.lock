@@ -131,31 +131,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "akhri_android"
-version = "0.2.0"
-dependencies = [
- "akhri_core",
- "jni 0.21.1",
-]
-
-[[package]]
-name = "akhri_core"
-version = "0.2.0"
-
-[[package]]
-name = "akhri_pasta"
-version = "0.2.0"
-dependencies = [
- "akhri_core",
- "arboard",
- "eframe",
- "png",
- "pollster",
- "rfd",
- "winit",
-]
-
-[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1011,6 +986,31 @@ name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
+name = "flashhop"
+version = "0.3.0"
+dependencies = [
+ "arboard",
+ "eframe",
+ "flashhop_core",
+ "png",
+ "pollster",
+ "rfd",
+ "winit",
+]
+
+[[package]]
+name = "flashhop_android"
+version = "0.3.0"
+dependencies = [
+ "flashhop_core",
+ "jni 0.21.1",
+]
+
+[[package]]
+name = "flashhop_core"
+version = "0.3.0"
 
 [[package]]
 name = "flate2"

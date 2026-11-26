@@ -1,6 +1,6 @@
 //! The desktop look: palette, Inter weights, and the few custom widgets (pills, round icon
 //! buttons, the ticket, tick progress, the top glow, vector icons, the window icon).
-//! android/src/app/akhripasta/Ui.kt mirrors the same tokens and shapes; change both together.
+//! android/src/app/flashhop/Ui.kt mirrors the same tokens and shapes; change both together.
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame, Margin, Mesh, Painter, Rect,
@@ -76,7 +76,7 @@ pub fn text(s: impl Into<String>, size: f32, w: W, color: Color32) -> RichText {
     RichText::new(s).font(font(size, w)).color(color)
 }
 
-/// One-line path that drops characters from the start ("…/AkhriPasta"), so the folder name stays
+/// One-line path that drops characters from the start ("…/FlashHop"), so the folder name stays
 /// visible. The full path shows on hover.
 pub fn path_label(ui: &mut Ui, path: &str, size: f32, w: W, color: Color32) -> Response {
     let fits = |s: &str| ui.painter().layout_no_wrap(s.to_owned(), font(size, w), color).size().x <= ui.available_width();

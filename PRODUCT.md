@@ -6,7 +6,7 @@
 
 adaptive
 
-Desktop (Linux, macOS) in egui; Android in Kotlin with platform widgets only (no AndroidX, no Compose). Both are thin views over one Rust engine.
+Desktop (Linux, macOS, Windows) in egui; Android in Kotlin with platform widgets only (no AndroidX, no Compose). Both are thin views over one Rust engine.
 
 ## Users
 
@@ -14,7 +14,7 @@ Tech-savvy people moving files, folders, screenshots and text between their own 
 
 ## Product Purpose
 
-Send anything to a nearby device without a cloud, an account, or a cable. Success is: drop or share, tap the device, the other side accepts, done. Received text lands straight in the clipboard.
+Send anything to a nearby device without a cloud, an account, or a cable. Success is: drop or share, tap the device, the other side accepts, done. Received text and pasted images land straight in the clipboard.
 
 ## Positioning
 
@@ -23,12 +23,12 @@ Direct device-to-device over the LAN: no server, no sign-in, no upload limit, ze
 ## Operating Context
 
 - Desktop: a small utility window kept open beside a file manager; files arrive by drag-and-drop, Files…/Folder… pickers, Ctrl+V, or "Open with". Incoming offers raise a system notification.
-- Android: mostly entered through Share → Akhri Pasta from another app; also Files / Paste buttons. Incoming offers notify when the app is not in front.
-- Devices appear automatically within ~2 s via UDP broadcast on port 47821.
+- Android: mostly entered through Share → FlashHop from another app; also Files / Paste buttons. Incoming offers notify when the app is not in front.
+- Devices appear automatically within ~2 s via UDP broadcast on port 47821. Devices sent to or accepted from lately sort first; from five devices on, a search field filters the list.
 
 ## Capabilities and Constraints
 
-- Items: files, folders (desktop), text (≤16 MB, lands in the receiver's clipboard), pasted images (desktop, re-encoded to PNG).
+- Items: files, folders (desktop), text (≤16 MB, lands in the receiver's clipboard), pasted images (re-encoded to PNG; saved like a file and also put on the receiver's clipboard).
 - States: searching for devices, devices found, staged items, incoming offer (accept/decline), transfer waiting/running (bytes, speed)/done/failed, cancel.
 - All user-visible wording for offers and job status comes from `core` (`summarize()`, `Job::status()`, `human()`); UIs must not diverge.
 - Binary size and idle cost are priorities. Desktop embeds one variable UI font (Inter) in place of egui's bundled fonts; no other new dependencies.
@@ -38,7 +38,7 @@ Direct device-to-device over the LAN: no server, no sign-in, no upload limit, ze
 
 ## Brand Commitments
 
-- Name: Akhri Pasta.
+- Name: FlashHop.
 - An app icon is wanted (Android adaptive icon + desktop window icon), drawn as vectors, no raster files.
 
 ## Evidence on Hand

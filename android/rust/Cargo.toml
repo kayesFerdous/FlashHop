@@ -1,12 +1,12 @@
 [package]
-name = "akhri_android"
-version = "0.2.0"
+name = "flashhop_android"
+version = "0.3.0"
 edition = "2024"
 
 [lib]
-name = "akhri"
+name = "flashhop"
 crate-type = ["cdylib"]
 
 [dependencies]
-akhri_core = { path = "../../core" }
+flashhop_core = { path = "../../core" }
 jni = "0.21"

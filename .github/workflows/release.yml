@@ -5,7 +5,7 @@ name: build
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -36,24 +36,40 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_B64" ]; then
             echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "AKHRI_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "FLASHHOP_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           fi
       - run: android/build.sh
         env:
-          AKHRI_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          AKHRI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-      - run: mv android/akhri_pasta.apk akhri_pasta-android.apk
+          FLASHHOP_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FLASHHOP_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      - run: mv android/flashhop.apk flashhop-android.apk
       - uses: actions/upload-artifact@v7
-        with: { name: android, path: akhri_pasta-android.apk }
+        with: { name: android, path: flashhop-android.apk }
 
   linux:
     runs-on: ubuntu-22.04 # older glibc = runs on more distros
     steps:
       - uses: actions/checkout@v7
-      - run: cargo build --release -p akhri_pasta
-      - run: tar -C target/release -czf akhri_pasta-linux-x86_64.tar.gz akhri_pasta
+      - run: cargo build --release -p flashhop
+      # The icon (same rasterizer as the window icon) lets install.sh add an app-menu entry.
+      - run: ICON_PNG="$PWD/flashhop.png" cargo test --release -p flashhop icon
+      - run: tar -czf flashhop-linux-x86_64.tar.gz -C target/release flashhop -C "$PWD" flashhop.png
       - uses: actions/upload-artifact@v7
-        with: { name: linux, path: akhri_pasta-linux-x86_64.tar.gz }
+        with: { name: linux, path: flashhop-linux-x86_64.tar.gz }
+
+  windows:
+    runs-on: windows-latest
+    defaults: { run: { shell: bash } }
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static # no VC++ runtime needed on the user's machine
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release -p flashhop
+      # .ico for the Start menu shortcut install.ps1 creates (same rasterizer as the window icon).
+      - run: ICON_ICO="$PWD/flashhop.ico" cargo test --release -p flashhop icon
+      - run: cp target/release/flashhop.exe . && 7z a flashhop-windows-x86_64.zip flashhop.exe flashhop.ico
+      - uses: actions/upload-artifact@v7
+        with: { name: windows, path: flashhop-windows-x86_64.zip }
 
   macos:
     runs-on: macos-latest
@@ -61,17 +77,17 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - run: |
-          cargo build --release -p akhri_pasta --target aarch64-apple-darwin
-          cargo build --release -p akhri_pasta --target x86_64-apple-darwin
+          cargo build --release -p flashhop --target aarch64-apple-darwin
+          cargo build --release -p flashhop --target x86_64-apple-darwin
       - name: Universal .app bundle
         run: |
           VERSION=$(grep -m1 '^version' desktop/Cargo.toml | cut -d'"' -f2)
-          APP="Akhri Pasta.app"
+          APP="FlashHop.app"
           mkdir -p "$APP/Contents/MacOS"
-          lipo -create -output "$APP/Contents/MacOS/akhri_pasta" \
-            target/aarch64-apple-darwin/release/akhri_pasta target/x86_64-apple-darwin/release/akhri_pasta
+          lipo -create -output "$APP/Contents/MacOS/flashhop" \
+            target/aarch64-apple-darwin/release/flashhop target/x86_64-apple-darwin/release/flashhop
           # Icon: the same rasterizer as the window icon (ui::app_icon) writes a 1024 px PNG.
-          ICON_PNG="$PWD/icon.png" cargo test --release -p akhri_pasta --target aarch64-apple-darwin icon
+          ICON_PNG="$PWD/icon.png" cargo test --release -p flashhop --target aarch64-apple-darwin icon
           mkdir -p icon.iconset "$APP/Contents/Resources"
           for s in 16 32 128 256 512; do
             sips -z $s $s icon.png --out "icon.iconset/icon_${s}x${s}.png" > /dev/null
@@ -82,9 +98,9 @@ jobs:
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>CFBundleName</key><string>Akhri Pasta</string>
-            <key>CFBundleIdentifier</key><string>app.akhripasta</string>
-            <key>CFBundleExecutable</key><string>akhri_pasta</string>
+            <key>CFBundleName</key><string>FlashHop</string>
+            <key>CFBundleIdentifier</key><string>app.flashhop</string>
+            <key>CFBundleExecutable</key><string>flashhop</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>$VERSION</string>
@@ -95,13 +111,13 @@ jobs:
           </dict></plist>
           EOF
           codesign --force --deep -s - "$APP"   # ad-hoc: no Apple developer account needed
-          ditto -c -k --keepParent "$APP" akhri_pasta-macos.zip
+          ditto -c -k --keepParent "$APP" flashhop-macos.zip
       - uses: actions/upload-artifact@v7
-        with: { name: macos, path: akhri_pasta-macos.zip }
+        with: { name: macos, path: flashhop-macos.zip }
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, android, linux, macos]
+    needs: [test, android, linux, windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -116,11 +132,12 @@ jobs:
 
           | Device | File | First run |
           |---|---|---|
-          | Android 11+ | `akhri_pasta-android.apk` | Open it on the phone and allow "install unknown apps" when asked. |
-          | macOS 11+ (Intel and Apple Silicon) | `akhri_pasta-macos.zip` | Unzip and move to Applications. On first open, macOS blocks it because it is unsigned: go to System Settings → Privacy & Security → **Open Anyway**. |
-          | Linux x86_64 | `akhri_pasta-linux-x86_64.tar.gz` | `tar xzf akhri_pasta-linux-x86_64.tar.gz && ./akhri_pasta` |
+          | Android 11+ | `flashhop-android.apk` | Open it on the phone and allow "install unknown apps" when asked. |
+          | macOS 11+ (Intel and Apple Silicon) | `flashhop-macos.zip` | Unzip and move to Applications. On first open, macOS blocks it because it is unsigned: go to System Settings → Privacy & Security → **Open Anyway**. |
+          | Windows 10/11 x64 | `flashhop-windows-x86_64.zip` | In PowerShell: `irm https://raw.githubusercontent.com/kayesFerdous/FlashHop/main/install.ps1 \| iex`, or unzip and run `flashhop.exe`. Click **Allow** when Windows Firewall asks. |
+          | Linux x86_64 | `flashhop-linux-x86_64.tar.gz` | `curl -fsSL https://raw.githubusercontent.com/kayesFerdous/FlashHop/main/install.sh \| sh`, or `tar xzf flashhop-linux-x86_64.tar.gz && ./flashhop` |
 
           All devices must be on the same Wi-Fi/router. Port 47821 (UDP + TCP) must not be blocked by a firewall.
           EOF
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "Akhri Pasta $GITHUB_REF_NAME" --notes-file notes.md --generate-notes
+            --title "FlashHop $GITHUB_REF_NAME" --notes-file notes.md --generate-notes

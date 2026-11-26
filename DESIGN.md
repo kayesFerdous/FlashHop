@@ -1,5 +1,5 @@
 ---
-name: Akhri Pasta
+name: FlashHop
 description: LAN sharing where the payload is a ticket on a cobalt dock.
 colors:
   ground-lavender: "#E9EBF5"
@@ -89,7 +89,7 @@ components:
     padding: "18px 16px"
 ---
 
-# Design System: Akhri Pasta
+# Design System: FlashHop
 
 ## Overview
 
@@ -131,7 +131,7 @@ Desktop embeds Inter variable (`desktop/assets/Inter.ttf`, OFL); weights are nam
 
 ## Layout
 
-One column. Desktop: max 560px wide, centered, 20px side gutters, default window 440×720 (min 360×520). Android: 20dp gutters, edge to edge; the glow runs under the status bar, content is clipped below it. Order: top bar (this device + received-files + settings round buttons), headline, incoming offer tickets, dock, Devices card, Activity card. Settings is a separate view on desktop (Esc goes back) and a rename dialog on Android.
+One column. Desktop: max 560px wide, centered, 20px side gutters, default window 440×720 (min 360×520). Android: 20dp gutters, edge to edge; the glow runs under the status bar, content is clipped below it. Order: top bar (this device + received-files + settings round buttons), headline, incoming offer tickets, dock, Devices card, Activity card. Settings is a separate view on both, replacing the main column (Esc on desktop, Back on Android): device name and the received-files folder.
 
 ## Elevation & Depth
 
@@ -147,13 +147,14 @@ Radii: pills are fully round; ticket 22; card 24; dock 28. Ticket notches are 11
 - **Round button**: same tones as pills. Disabled send shows a mist circle with a faded arrow. On Android the touch target is never under 48dp, even when the circle is drawn smaller.
 - **Dock**: cobalt block. Empty: lime "+" button (opens the file picker), "Drop files or folders" / "Share or pick files", helper line, glass pills (Files…, Folder…, Paste on desktop; Files, Paste on Android). Staged: the outgoing ticket, then the glass pills. Compact (nothing staged while an offer or transfer is live): one row of lime + and glass pills, and Activity moves above Devices so the live percentage stays in view. On narrow desktop windows the pills drop their icons instead of overflowing.
 - **Ticket**: top = title or offer summary with a badge; perforation; stub = item count and total (outgoing) or "Saves to" plus Decline/Accept (incoming). On send, the outgoing ticket is the one motion moment: it slides right by 60% of its width with ease-in and fades out over 320 ms, above the page, while the dock re-renders underneath.
-- **Device row**: avatar initial, name and IP, lime send round button.
-- **Job row**: state badge (amber waiting, cobalt running, green done, red failed), label, core status string ("Sent, 2.0 GB", "Couldn't connect. Is Akhri Pasta open on the other device?"), cancel while active; running rows add the big percentage and a tick bar.
+- **Device row**: avatar initial, name, core detail line (IP, or "Recent · IP" for devices used lately, which sort first), lime send round button.
+- **Device search**: a raised single-line field ("Find a device") under the Devices title from five devices on; filters by name or IP; Enter/Go with one match sends to it.
+- **Job row**: state badge (amber waiting, cobalt running, green done, red failed), label, core status string ("Sent, 2.0 GB", "Couldn't connect. Is FlashHop open on the other device?"), cancel while active; running rows add the big percentage and a tick bar.
 
 ## Do's and Don'ts
 
 - Do keep wording for offers and status in `core` (`summarize()`, `Job::status()`); the UIs only lay it out.
-- Do change `desktop/src/ui.rs` and `android/src/app/akhripasta/Ui.kt` together.
+- Do change `desktop/src/ui.rs` and `android/src/app/flashhop/Ui.kt` together.
 - Do keep lime for go and cobalt for sending; one of each per control.
 - Don't add shadows, borders on cards, gradients beyond the top wash, or emoji/glyph icons.
 - Don't put a small label above a heading; headings carry themselves.

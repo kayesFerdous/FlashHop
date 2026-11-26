@@ -1,6 +1,6 @@
 [package]
-name = "akhri_core"
-version = "0.2.0"
+name = "flashhop_core"
+version = "0.3.0"
 edition = "2024"
 
 # No dependencies: protocol + engine on std only. Shared by desktop and Android.
