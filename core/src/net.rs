@@ -5,11 +5,16 @@
 //! Transfer: sender -> MAGIC (plain), then a Noise_XX_25519_ChaChaPoly_BLAKE2s handshake
 //!           (3 messages, each a u16 length + bytes; prologue = MAGIC) that proves both devices'
 //!           permanent keys: the sender aborts unless the receiver's key is the one it announced.
+//!           Message 1 carries BLAKE2s(sender key | nonce), message 3 reveals the 32-byte nonce, so
+//!           neither side can steer the handshake hash. Its first 4 bytes (u32 LE % 1e6) are the
+//!           6-digit code both screens show when the devices haven't verified each other.
 //!           Everything after is
 //!           encrypted in frames of u16 length + ChaCha20-Poly1305 ciphertext (≤ 65535 bytes):
-//!           sender -> name | count u32 | count * (kind u8, path, size u64)
+//!           sender -> name | check u8 | count u32 | count * (kind u8, path, size u64)
 //!           kind: 0 file, 1 text, 2 clipboard image (a PNG file)
+//!           receiver -> check u8 (1: either device hasn't verified the other; both show the code)
 //!           receiver -> 1 (accept) / 0 (decline)
+//!           if check: sender -> 1 (its user confirmed the code)
 //!           sender -> raw bytes of every entry, in order
 //!           receiver -> 1 (all saved)
 //! Strings are u16 length + utf8. Integers are little endian.
@@ -23,12 +28,18 @@ use std::{
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering::Relaxed},
+        mpsc,
     },
     time::{Duration, Instant},
 };
 
+use snow::{
+    params::HashChoice,
+    resolvers::{CryptoResolver, DefaultResolver},
+};
+
 pub const PORT: u16 = 47821;
-const MAGIC: &[u8; 4] = b"AKP2";
+const MAGIC: &[u8; 4] = b"AKP3";
 const ANNOUNCE: Duration = Duration::from_secs(2);
 const EXPIRE: Duration = Duration::from_secs(7);
 const CHUNK: u64 = 4 << 20; // progress update granularity
@@ -80,6 +91,10 @@ pub struct Offer {
     pub from: String,
     /// The sender's permanent public key, proven by the handshake.
     pub key: [u8; 32],
+    /// The sender hasn't verified this device yet and wants the code compared.
+    pub check: bool,
+    /// The 6-digit code for this connection, "123 456". Both ends compute the same one.
+    pub code: String,
     pub entries: Vec<Entry>,
 }
 
@@ -259,24 +274,46 @@ fn walk(p: &Path, name: String, out: &mut Vec<(Entry, Src)>) -> io::Result<()> {
 }
 
 /// Sends to `addr`, which must prove it holds the private half of `expect` (its announced key).
-/// `None` skips that check; only the headless test peer uses it.
-pub fn send(addr: SocketAddr, me: &str, id: &Identity, expect: Option<[u8; 32]>, items: Vec<Item>, t: &Transfer) {
-    t.end(send_inner(addr, me, id, expect, items, t));
+/// `None` skips that check; only the headless test peer uses it. `check`: this device hasn't
+/// verified the receiver. If either side wants the code compared, `confirm` gets it and the
+/// data waits until this device's user answers through the returned channel.
+#[allow(clippy::too_many_arguments)]
+pub fn send(
+    addr: SocketAddr,
+    me: &str,
+    id: &Identity,
+    expect: Option<[u8; 32]>,
+    check: bool,
+    items: Vec<Item>,
+    t: &Transfer,
+    confirm: impl FnOnce(&str) -> mpsc::Receiver<bool>,
+) {
+    t.end(send_inner(addr, me, id, expect, check, items, t, confirm));
 }
 
-fn send_inner(addr: SocketAddr, me: &str, id: &Identity, expect: Option<[u8; 32]>, items: Vec<Item>, t: &Transfer) -> io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn send_inner(
+    addr: SocketAddr,
+    me: &str,
+    id: &Identity,
+    expect: Option<[u8; 32]>,
+    check: bool,
+    items: Vec<Item>,
+    t: &Transfer,
+    confirm: impl FnOnce(&str) -> mpsc::Receiver<bool>,
+) -> io::Result<()> {
     let entries = expand(items)?;
     t.total.store(entries.iter().map(|(e, _)| e.size).sum(), Relaxed);
     let sock = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     *t.sock.lock().unwrap() = Some(sock.try_clone()?);
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let (secure, theirs) = Secure::connect(&sock, id)?;
+    let (secure, theirs, code) = Secure::connect(&sock, id)?;
     if expect.is_some_and(|k| k != theirs) {
         return Err(io::Error::other("Not sent: it couldn't prove it's that device."));
     }
     let mut w = BufWriter::with_capacity(BUF, secure);
-    sock.set_read_timeout(None)?; // the receiver may take its time to accept
     put_str(&mut w, me)?;
+    w.write_all(&[check as u8])?;
     w.write_all(&u32::try_from(entries.len()).map_err(|_| bad("too many files"))?.to_le_bytes())?;
     for (e, _) in &entries {
         w.write_all(&[if e.text { 1 } else if e.image { 2 } else { 0 }])?;
@@ -284,8 +321,34 @@ fn send_inner(addr: SocketAddr, me: &str, id: &Identity, expect: Option<[u8; 32]
         w.write_all(&e.size.to_le_bytes())?;
     }
     w.flush()?;
-    if get::<1>(w.get_mut())? != [1] {
+    let asked = get::<1>(w.get_mut())? == [1]; // read it even when ours already says check
+    let check = check || asked;
+    sock.set_read_timeout(None)?; // the receiver may take its time to accept
+    let mut accepted = None;
+    if check {
+        // Both users answer in any order: the receiver's accept may arrive while ours is pending.
+        let answer = confirm(&code);
+        loop {
+            match wait_user(&sock, &answer)? {
+                Some(true) => break,
+                Some(false) => return Err(io::Error::other("Cancelled")),
+                None if accepted.is_none() => accepted = Some(get::<1>(w.get_mut())? == [1]),
+                None => return Err(io::ErrorKind::ConnectionAborted.into()),
+            }
+            if accepted == Some(false) {
+                return Err(io::Error::other("declined"));
+            }
+        }
+    }
+    let accepted = match accepted {
+        Some(a) => a,
+        None => get::<1>(w.get_mut())? == [1],
+    };
+    if !accepted {
         return Err(io::Error::other("declined"));
+    }
+    if check {
+        w.write_all(&[1])?;
     }
     t.set(State::Running);
     sock.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -307,20 +370,40 @@ fn send_inner(addr: SocketAddr, me: &str, id: &Identity, expect: Option<[u8; 32]
     Ok(())
 }
 
+/// Waits for this device's user to answer while watching the connection. `None`: the other
+/// device sent something or hung up first.
+fn wait_user(sock: &TcpStream, answer: &mpsc::Receiver<bool>) -> io::Result<Option<bool>> {
+    loop {
+        match answer.recv_timeout(Duration::from_millis(200)) {
+            Ok(yes) => return Ok(Some(yes)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(Some(false)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        sock.set_nonblocking(true)?;
+        let r = sock.peek(&mut [0]);
+        sock.set_nonblocking(false)?;
+        if !matches!(r, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+            return Ok(None);
+        }
+    }
+}
+
 // ---------- receive ----------
 
-/// Reads the offer, asks `ask` (blocks until the user decides), then saves into `dir`.
+/// Reads the offer and hands it to `ask`, which returns whether this device wants the code
+/// compared plus a channel for the user's answer, then saves into `dir`.
 /// Returns what goes on the clipboard: received texts and clipboard images.
-pub fn receive(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> Vec<Clip> {
+pub fn receive(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: impl FnOnce(&Offer) -> (bool, mpsc::Receiver<bool>)) -> Vec<Clip> {
     t.end(receive_inner(sock, dir, id, t, ask)).unwrap_or_default()
 }
 
-fn receive_inner(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: impl FnOnce(&Offer) -> bool) -> io::Result<Vec<Clip>> {
+fn receive_inner(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: impl FnOnce(&Offer) -> (bool, mpsc::Receiver<bool>)) -> io::Result<Vec<Clip>> {
     *t.sock.lock().unwrap() = Some(sock.try_clone()?);
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let (secure, key) = Secure::accept(&sock, id)?;
+    let (secure, key, code) = Secure::accept(&sock, id)?;
     let mut r = BufReader::with_capacity(BUF, secure);
     let from = get_str(&mut r)?;
+    let check = get::<1>(&mut r)? == [1];
     let n = u32::from_le_bytes(get(&mut r)?);
     let mut entries = vec![];
     for _ in 0..n {
@@ -332,13 +415,25 @@ fn receive_inner(sock: TcpStream, dir: &Path, id: &Identity, t: &Transfer, ask: 
         }
         entries.push(e);
     }
-    let offer = Offer { from, key, entries };
+    let offer = Offer { from, key, check, code, entries };
     t.total.store(offer.entries.iter().map(|e| e.size).sum(), Relaxed);
-    if !ask(&offer) {
+    let (mine, answer) = ask(&offer);
+    let check = check || mine;
+    r.get_mut().write_all(&[check as u8])?;
+    let Some(yes) = wait_user(&sock, &answer)? else {
+        return Err(io::Error::other("Cancelled on the other device."));
+    };
+    if !yes {
         let _ = r.get_mut().write_all(&[0]);
         return Err(io::Error::other("declined"));
     }
     r.get_mut().write_all(&[1])?;
+    if check {
+        sock.set_read_timeout(None)?; // the sender's user is still comparing the code
+        if get::<1>(&mut r).ok() != Some([1]) {
+            return Err(io::Error::other("Cancelled on the other device."));
+        }
+    }
     t.set(State::Running);
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
     fs::create_dir_all(dir)?;
@@ -434,8 +529,6 @@ impl Identity {
 
 /// The transfer stream after MAGIC: a Noise XX handshake (fresh ephemeral keys plus both devices'
 /// permanent keys), then ChaCha20-Poly1305 frames (u16 length + ciphertext) both ways.
-// ponytail: trust on first use. The first contact with a device isn't verified (no codes to
-// compare, by choice); every later one is. Add a code comparison at first contact if that matters.
 struct Secure<'a> {
     sock: &'a TcpStream,
     noise: snow::TransportState,
@@ -445,37 +538,58 @@ struct Secure<'a> {
 }
 
 impl<'a> Secure<'a> {
-    /// Sender side: MAGIC, then the initiator half of the handshake. Returns the receiver's proven key.
-    fn connect(sock: &'a TcpStream, me: &Identity) -> io::Result<(Self, [u8; 32])> {
+    /// Sender side: MAGIC, then the initiator half of the handshake.
+    /// Returns the receiver's proven key and the connection's code.
+    fn connect(sock: &'a TcpStream, me: &Identity) -> io::Result<(Self, [u8; 32], String)> {
         let mut hs = noise()?.local_private_key(&me.secret).map_err(crypto)?.build_initiator().map_err(crypto)?;
         let mut buf = vec![0; FRAME];
-        let n = hs.write_message(&[], &mut buf).map_err(crypto)?; // -> e
+        let mut nonce = [0; 32];
+        DefaultResolver.resolve_rng().ok_or_else(|| bad("no random source"))?.try_fill_bytes(&mut nonce).map_err(crypto)?;
+        let n = hs.write_message(&commit(&me.public, &nonce), &mut buf).map_err(crypto)?; // -> e, commitment
         put_frame(sock, MAGIC, &buf[..n])?;
         hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?; // <- e, ee, s, es
-        let n = hs.write_message(&[], &mut buf).map_err(crypto)?; // -> s, se
+        let n = hs.write_message(&nonce, &mut buf).map_err(crypto)?; // -> s, se, nonce
         put_frame(sock, &[], &buf[..n])?;
         Self::new(sock, hs)
     }
 
-    /// Receiver side: checks MAGIC, then answers the handshake. Returns the sender's proven key.
-    fn accept(sock: &'a TcpStream, me: &Identity) -> io::Result<(Self, [u8; 32])> {
+    /// Receiver side: checks MAGIC, then answers the handshake.
+    /// Returns the sender's proven key and the connection's code.
+    fn accept(sock: &'a TcpStream, me: &Identity) -> io::Result<(Self, [u8; 32], String)> {
         if &get::<4>(&mut &*sock)? != MAGIC {
             return Err(bad("not a FlashHop sender (or a different version)"));
         }
         let mut hs = noise()?.local_private_key(&me.secret).map_err(crypto)?.build_responder().map_err(crypto)?;
         let mut buf = vec![0; FRAME];
-        hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?;
+        let n = hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?;
+        let promised = buf[..n].to_vec();
         let n = hs.write_message(&[], &mut buf).map_err(crypto)?;
         put_frame(sock, &[], &buf[..n])?;
-        hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?;
+        let n = hs.read_message(&get_frame(sock)?, &mut buf).map_err(crypto)?;
+        let theirs = hs.get_remote_static().ok_or_else(|| bad("no device key"))?;
+        if commit(theirs, &buf[..n]) != *promised {
+            return Err(bad("encryption: the sender broke its commitment"));
+        }
         Self::new(sock, hs)
     }
 
-    fn new(sock: &'a TcpStream, hs: snow::HandshakeState) -> io::Result<(Self, [u8; 32])> {
+    fn new(sock: &'a TcpStream, hs: snow::HandshakeState) -> io::Result<(Self, [u8; 32], String)> {
         let theirs = hs.get_remote_static().and_then(|k| k.try_into().ok()).ok_or_else(|| bad("no device key"))?;
+        let c = u32::from_le_bytes(hs.get_handshake_hash()[..4].try_into().unwrap()) % 1_000_000;
         let noise = hs.into_transport_mode().map_err(crypto)?;
-        Ok((Self { sock, noise, plain: vec![], pos: 0, frame: vec![0; FRAME + 2] }, theirs))
+        Ok((Self { sock, noise, plain: vec![], pos: 0, frame: vec![0; FRAME + 2] }, theirs, format!("{:03} {:03}", c / 1000, c % 1000)))
     }
+}
+
+/// The sender's commitment in handshake message 1: it can't change its key or nonce after
+/// seeing the receiver's, so a man in the middle can't make two connections show one code.
+fn commit(key: &[u8], nonce: &[u8]) -> [u8; 32] {
+    let mut h = DefaultResolver.resolve_hash(&HashChoice::Blake2s).expect("blake2s is compiled in");
+    h.input(key);
+    h.input(nonce);
+    let mut out = [0; 32];
+    h.result(&mut out);
+    out
 }
 
 impl Read for Secure<'_> {
@@ -587,7 +701,7 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let rx = std::thread::spawn(move || {
             let t = Transfer::new();
-            let clips = receive(l.accept().unwrap().0, &dst, &phone, &t, |o| o.from == "pc" && o.key == pc_key && o.entries.len() == 6);
+            let clips = receive(l.accept().unwrap().0, &dst, &phone, &t, |o| answered(o.from == "pc" && o.key == pc_key && o.entries.len() == 6 && !o.check));
             (clips, t.state())
         });
         let t = Transfer::new();
@@ -601,7 +715,7 @@ mod tests {
             Item::Image(img, "c.png".into()),
             Item::Open(nested, "Album/sub/n.txt".into()),
         ];
-        send(addr, "pc", &pc, Some(phone_key), items, &t);
+        send(addr, "pc", &pc, Some(phone_key), false, items, &t, |_| panic!("both sides trust each other: no code"));
         let (clips, rstate) = rx.join().unwrap();
         assert_eq!((t.state(), rstate), (State::Done, State::Done));
         assert_eq!(clips, [Clip::Text("clip".into()), Clip::Image(root.join("dst/c.png"))]);
@@ -628,14 +742,93 @@ mod tests {
             let mut asked = false;
             receive(l.accept().unwrap().0, Path::new("/nonexistent"), &impostor, &t, |_| {
                 asked = true;
-                true
+                answered(true)
             });
             asked
         });
         let t = Transfer::new();
-        send(addr, "pc", &pc, Some(real.public), vec![Item::Text("secret".into())], &t); // expects `real`
+        send(addr, "pc", &pc, Some(real.public), true, vec![Item::Text("secret".into())], &t, |_| answered(true).1); // expects `real`
         assert!(matches!(t.state(), State::Failed(e) if e.contains("couldn't prove")), "{:?}", t.state());
         assert!(!rx.join().unwrap(), "the impostor never sees the offer");
+    }
+
+    /// An `ask` result: no code check from this side, and the user's answer already given.
+    fn answered(yes: bool) -> (bool, mpsc::Receiver<bool>) {
+        let (tx, rx) = mpsc::channel();
+        tx.send(yes).unwrap();
+        (false, rx)
+    }
+
+    /// A loopback text send with the sender asking for the code check. Each side's user answers
+    /// `Some(yes)` (the sender after a delay, so the receiver's answer comes first) or never.
+    fn checked(sender: Option<bool>, receiver: Option<bool>) -> (State, State, String, String) {
+        let (pc, phone) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let phone_key = phone.public;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let rx = std::thread::spawn(move || {
+            let (t, mut code, (tx, answer)) = (Transfer::new(), String::new(), mpsc::channel());
+            if let Some(yes) = receiver {
+                tx.send(yes).unwrap();
+            }
+            receive(l.accept().unwrap().0, &std::env::temp_dir(), &phone, &t, |o| {
+                assert!(o.check);
+                code = o.code.clone();
+                (false, answer)
+            });
+            drop(tx); // a user who never answers keeps the channel open
+            (t.state(), code)
+        });
+        let (t, mut code, (tx, answer)) = (Transfer::new(), String::new(), mpsc::channel());
+        if let Some(yes) = sender {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = tx.send(yes);
+            });
+        }
+        send(addr, "pc", &pc, Some(phone_key), true, vec![Item::Text("hi".into())], &t, |c| {
+            code = c.into();
+            answer
+        });
+        drop(tx);
+        let (rstate, rcode) = rx.join().unwrap();
+        (t.state(), rstate, code, rcode)
+    }
+
+    #[test]
+    fn code_check() {
+        let (s, r, code, rcode) = checked(Some(true), Some(true));
+        assert_eq!((s, r), (State::Done, State::Done));
+        assert_eq!(code, rcode, "both screens show the same code");
+        assert!(code.len() == 7 && code.chars().enumerate().all(|(i, c)| if i == 3 { c == ' ' } else { c.is_ascii_digit() }), "{code}");
+
+        // The receiver declines while the sender's card is open: the sender stops without an answer.
+        let (s, r, ..) = checked(None, Some(false));
+        assert_eq!((s, r), (State::Failed("Declined".into()), State::Failed("Declined".into())));
+
+        // The sender cancels (codes differ) while the offer is open: the offer goes away by itself.
+        let (s, r, ..) = checked(Some(false), None);
+        assert_eq!((s, r), (State::Failed("Cancelled".into()), State::Failed("Cancelled on the other device.".into())));
+    }
+
+    #[test]
+    fn broken_commitment_is_refused() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let sock = TcpStream::connect(addr).unwrap();
+            let me = Identity::generate().unwrap();
+            let mut hs = noise().unwrap().local_private_key(&me.secret).unwrap().build_initiator().unwrap();
+            let mut buf = vec![0; FRAME];
+            let n = hs.write_message(&commit(&me.public, &[1; 32]), &mut buf).unwrap();
+            put_frame(&sock, MAGIC, &buf[..n]).unwrap();
+            hs.read_message(&get_frame(&sock).unwrap(), &mut buf).unwrap();
+            let n = hs.write_message(&[2; 32], &mut buf).unwrap(); // not the nonce it promised
+            put_frame(&sock, &[], &buf[..n]).unwrap();
+        });
+        let (sock, _) = l.accept().unwrap();
+        assert!(Secure::accept(&sock, &Identity::generate().unwrap()).is_err());
     }
 
     #[test]

@@ -28,15 +28,16 @@ pub struct Peer {
     pub trust: Trust,
 }
 
-/// What this device knows about a peer's key (trust on first use, pinned per device name).
+/// What this device knows about a peer's key. Keys are pinned after a transfer whose code both
+/// users compared; until then both devices show that code.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Trust {
-    /// Never exchanged anything with a device of this name.
+    /// Neither this key nor this name has been seen.
     New,
-    /// Same key as every earlier transfer.
+    /// This key completed a transfer before (under any name: renaming keeps the key).
     Verified,
     /// A device of this name is known, but with a different key: reinstalled, a second device
-    /// with the same name, or an impostor. Sending to it is refused until it is accepted once.
+    /// with the same name, or an impostor.
     Changed,
 }
 
@@ -55,10 +56,16 @@ impl Peer {
 /// How many recent device names `Engine::recent` keeps.
 const RECENT: usize = 5;
 
+/// A card waiting for this device's user: an incoming offer to accept, or (`outgoing`) the
+/// sender's own check that the other screen shows the same code.
 #[derive(Clone)]
 pub struct Offer {
     pub id: u64,
     pub summary: String,
+    /// The 6-digit code ("123 456") to compare with the other screen, when the devices haven't
+    /// verified each other yet.
+    pub code: Option<String>,
+    pub outgoing: bool,
 }
 
 #[derive(Clone)]
@@ -94,10 +101,11 @@ impl Job {
 
 struct Pending {
     offer: Offer,
+    /// The other device's name.
     from: String,
-    key: [u8; 32],
     reply: mpsc::Sender<bool>,
-    job: Job,
+    /// The incoming job, listed once accepted. `None` for the sender's code check.
+    job: Option<Job>,
 }
 
 pub struct Engine {
@@ -156,19 +164,32 @@ impl Engine {
     fn receive(&self, conn: TcpStream) {
         let t = Arc::new(Transfer::new());
         let dir = self.dir.lock().unwrap().clone();
+        let mut asked = None;
         let clips = net::receive(conn, &dir, &self.me, &t, |o| {
-            let (reply, decision) = mpsc::channel();
+            let (reply, answer) = mpsc::channel();
+            let trust = self.trust(&o.from, &o.key);
+            let check = o.check || trust != Trust::Verified;
             let mut summary = summarize(o);
-            if self.trust(&o.from, &o.key) == Trust::Changed {
-                summary += &format!(". This isn't the {} you used before; accept only if it's new or reinstalled.", o.from);
+            if check {
+                summary += &match trust {
+                    Trust::Changed => format!(". This isn't the {} you used before. Accept only if it shows the same code.", o.from),
+                    _ => format!(". Accept only if {} shows the same code.", o.from),
+                };
             }
-            let offer = Offer { id: self.next_id(), summary };
+            let offer = Offer { id: self.next_id(), summary, code: check.then(|| o.code.clone()), outgoing: false };
+            asked = Some((offer.id, o.from.clone(), o.key));
             let job = Job { id: self.next_id(), label: format!("From {}", o.from), incoming: true, t: t.clone() };
-            self.pending.lock().unwrap().push(Pending { offer, from: o.from.clone(), key: o.key, reply, job });
+            self.pending.lock().unwrap().push(Pending { offer, from: o.from.clone(), reply, job: Some(job) });
             self.changed();
-            decision.recv().unwrap_or(false)
+            (check, answer)
         });
         log_end("receive", &t);
+        if let Some((offer, from, key)) = asked {
+            self.unlist(offer); // still there if the sender hung up first
+            if t.state() == State::Done {
+                self.pin(&from, key);
+            }
+        }
         self.clips.lock().unwrap().extend(clips);
         self.changed();
     }
@@ -177,15 +198,27 @@ impl Engine {
         let Some((name, ip, key)) = self.peers.lock().unwrap().get(&peer).map(|p| (p.name.clone(), p.ip, p.key)) else { return };
         let t = Arc::new(Transfer::new());
         self.jobs.lock().unwrap().push(Job { id: self.next_id(), label: format!("To {name}"), incoming: false, t: t.clone() });
-        if self.trust(&name, &key) == Trust::Changed {
-            // The offer card on the other side explains; here one short line has to fit a phone.
-            t.end::<()>(Err(io::Error::other("Not sent: unrecognized key. Accept a send from it first.")));
-            return self.changed();
-        }
         self.touch(&name);
+        let trust = self.trust(&name, &key);
         let (e, me) = (self.clone(), self.name.lock().unwrap().clone());
         thread::spawn(move || {
-            net::send(SocketAddr::new(ip, net::PORT), &me, &e.me, Some(key), items, &t);
+            let mut card = None;
+            net::send(SocketAddr::new(ip, net::PORT), &me, &e.me, Some(key), trust != Trust::Verified, items, &t, |code| {
+                let (reply, answer) = mpsc::channel();
+                let summary = match trust {
+                    Trust::Changed => format!("This isn't the {name} you used before. Send only if it shows the same code."),
+                    Trust::New => format!("First time sending to {name}. Send only if it shows the same code."),
+                    Trust::Verified => format!("{name} asks to compare codes. Send only if it shows the same one."),
+                };
+                let offer = Offer { id: e.next_id(), summary, code: Some(code.into()), outgoing: true };
+                card = Some(offer.id);
+                e.pending.lock().unwrap().push(Pending { offer, from: name.clone(), reply, job: None });
+                e.changed();
+                answer
+            });
+            if let Some(id) = card {
+                e.unlist(id); // still there if the receiver declined or hung up first
+            }
             log_end(&format!("send to {name} ({ip})"), &t);
             if t.state() == State::Done {
                 e.pin(&name, key);
@@ -195,19 +228,23 @@ impl Engine {
         self.changed();
     }
 
+    /// Answers a card: accept or decline an offer, or confirm or cancel the sender's code check.
     pub fn decide(&self, offer: u64, accept: bool) {
         let mut pending = self.pending.lock().unwrap();
         if let Some(i) = pending.iter().position(|p| p.offer.id == offer) {
             let p = pending.remove(i);
-            if accept {
+            if let (true, Some(job)) = (accept, p.job) {
                 self.touch(&p.from);
-                self.pin(&p.from, p.key);
-                self.jobs.lock().unwrap().push(p.job);
+                self.jobs.lock().unwrap().push(job);
             }
             let _ = p.reply.send(accept);
         }
         drop(pending);
         self.changed();
+    }
+
+    fn unlist(&self, offer: u64) {
+        self.pending.lock().unwrap().retain(|p| p.offer.id != offer);
     }
 
     pub fn cancel(&self, job: u64) {
@@ -241,7 +278,7 @@ impl Engine {
     /// Remembers `key` for `name` (several keys per name are fine: two phones called "Pixel 8a").
     fn pin(&self, name: &str, key: [u8; 32]) {
         let mut known = self.known.lock().unwrap();
-        if trust(&known, name, &key) != Trust::Verified {
+        if !known.iter().any(|(n, k)| n == name && *k == key) {
             known.push((name.to_owned(), key));
             let txt: String = known.iter().map(|(n, k)| format!("{} {}\n", hex(k), n.replace('\n', " "))).collect();
             let _ = fs::write(self.state.join("known"), txt);
@@ -287,7 +324,7 @@ impl Engine {
 }
 
 fn trust(known: &[(String, [u8; 32])], name: &str, key: &[u8; 32]) -> Trust {
-    if known.iter().any(|(n, k)| n == name && k == key) {
+    if known.iter().any(|(_, k)| k == key) {
         Trust::Verified
     } else if known.iter().any(|(n, _)| n == name) {
         Trust::Changed
@@ -385,5 +422,6 @@ mod tests {
         assert_eq!(super::trust(&known, "Pixel 8a", &a), Verified);
         assert_eq!(super::trust(&known, "Pixel 8a", &b), Changed);
         assert_eq!(super::trust(&known, "Laptop", &b), New);
+        assert_eq!(super::trust(&known, "Renamed", &a), Verified, "a key stays trusted under a new name");
     }
 }

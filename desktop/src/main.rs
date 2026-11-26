@@ -131,6 +131,9 @@ fn watch(e: Arc<Engine>, ctx: egui::Context) {
             let fresh: Vec<_> = e.offers().into_iter().filter(|o| o.id > last_offer).collect();
             for o in fresh {
                 last_offer = o.id;
+                if o.outgoing {
+                    continue; // this device's own code check: the user just pressed send here
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
                 notify(&format!("Incoming: {}", o.summary));
             }
@@ -440,21 +443,29 @@ impl App {
             None,
             |ui| {
                 ui.horizontal(|ui| {
-                    ui::badge(ui, Icon::Down, ui::LIME, ui::INK, 42.0);
+                    ui::badge(ui, if o.outgoing { Icon::Up } else { Icon::Down }, ui::LIME, ui::INK, 42.0);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.add(Label::new(ui::text(&o.summary, 15.0, W::Medium, ui::INK)).wrap());
+                        if let Some(code) = &o.code {
+                            ui.add_space(8.0);
+                            ui.label(ui::text(code, 32.0, W::Light, ui::INK));
+                        }
                     });
                 });
             },
             |ui| {
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui::pill(ui, "Accept", Some(Icon::Check), Tone::Ink, true).clicked() {
+                        let (yes, no) = if o.outgoing { ("Matches", "Cancel") } else { ("Accept", "Decline") };
+                        if ui::pill(ui, yes, Some(Icon::Check), Tone::Ink, true).clicked() {
                             self.e.decide(o.id, true);
-                            self.persist(); // the sender is now a recent device
+                            self.persist(); // the other device is now a recent one
                         }
-                        if ui::pill(ui, "Decline", None, Tone::Card, true).clicked() {
+                        if ui::pill(ui, no, None, Tone::Card, true).clicked() {
                             self.e.decide(o.id, false);
+                        }
+                        if o.outgoing {
+                            return;
                         }
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;

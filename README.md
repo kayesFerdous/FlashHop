@@ -57,7 +57,7 @@ All versions are on the [releases page](https://github.com/kayesFerdous/FlashHop
 ## Why FlashHop
 
 - **Fast.** Bytes go straight from one device to the other over TCP. No server in the middle.
-- **Encrypted and verified.** Every transfer uses fresh keys (Noise protocol, ChaCha20-Poly1305), so others on the Wi‑Fi can't read what you send. Each device also has a permanent key: once two devices have talked, an impostor using the same name gets flagged and refused.
+- **Encrypted and verified.** Every transfer uses fresh keys (Noise protocol, ChaCha20-Poly1305), so others on the Wi‑Fi can't read what you send. The first time two devices meet (or after one is reinstalled), both screens show the same 6-digit code to compare, so an impostor can't slip in.
 - **Private.** Nothing leaves your router. There's no sign-up and no telemetry.
 - **Paste anything.** Press Ctrl+V (Cmd+V on a Mac) to send copied files, screenshots, or text. Text and images land on the other device's clipboard.
 - **Small.** The desktop app is a single ~10 MB binary, and the APK is ~1 MB.
@@ -114,7 +114,7 @@ android/src/     Kotlin screens, plain Android widgets
 
 - **Discovery:** every 2 seconds, each device broadcasts its name over UDP, and devices that hear it reply directly.
 - **Transfer:** one TCP connection per send. A Noise XX handshake proves both devices' permanent keys and sets up fresh session keys, then a header, accept/decline, and the file bytes, all encrypted.
-- **Trust:** like SSH, the first transfer with a device remembers its key. Later, a device using a known name with a different key shows **Not verified**, sends to it are refused, and its offers carry a warning (accept one if it was really reinstalled).
+- **Trust:** each device has a permanent key. Until two devices have completed a transfer, both show a 6-digit code derived from the handshake (a commitment in its first message stops a man in the middle from forcing two connections onto one code). The sender taps **Matches** and the receiver taps **Accept**; after that their keys are remembered and no code is shown. A known name with a new key (reinstalled, or an impostor) shows **Not verified** and gets the code again.
 - **Safety:** every incoming path is checked, so a sender can't write outside your downloads folder. The protocol is versioned, so mismatched builds refuse each other instead of corrupting files.
 
 </details>
@@ -123,7 +123,6 @@ android/src/     Kotlin screens, plain Android widgets
 <summary><b>Not done yet</b></summary>
 <br>
 
-- **The first contact isn't verified.** Trust starts at the first transfer (as with SSH), with no code to compare.
 - Android receives only while the app is open.
 - Empty folders aren't sent. There's no tray icon and no auto-accept for trusted devices.
 

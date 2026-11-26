@@ -101,7 +101,7 @@ It is an Operate surface: one screen, scanned in seconds, used many times a day 
 
 **Key Characteristics:**
 - Light only. Lavender ground, white cards, cobalt dock, lime go, black primary pill.
-- The ticket is the signature: outgoing items live on one, incoming offers arrive as one.
+- The ticket is the signature: outgoing items live on one, incoming offers arrive as one. A code check is a ticket too: the 6-digit code sits under the summary as a light numeral; the sender's own check has an up badge and Cancel / Matches.
 - Two-tone headline: the state in ink, the next step in muted slate.
 - Large light numerals plus a tick bar for live progress.
 - Round icon buttons and pills; no square buttons anywhere.

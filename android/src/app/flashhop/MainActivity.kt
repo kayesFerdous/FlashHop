@@ -485,11 +485,14 @@ class MainActivity : Activity() {
     }
 
     private fun offerTicket(o: Offer) = Ticket(this).apply {
-        top.addView(row(badge(Ic.Down, C.LIME, C.INK, 44), tv(o.summary, 16f, 500, C.INK, lines = 0).weight1().margins(l = dp(12))))
+        val text = column(tv(o.summary, 16f, 500, C.INK, lines = 0))
+        if (o.code.isNotEmpty()) text.addView(tv(o.code, 34f, 300, C.INK).margins(t = dp(8)))
+        top.addView(row(badge(if (o.outgoing) Ic.Up else Ic.Down, C.LIME, C.INK, 44), text.weight1().margins(l = dp(12))))
         stub.addView(row(
-            column(tv("Saves to", 12f, 400, C.MUTED), tv(shortDir(), 14f, 500, C.INK).margins(t = dp(3))).weight1(),
-            pill("Decline", null, Tone.Card) { Core.decide(o.id, false) },
-            pill("Accept", Ic.Check, Tone.Ink) { Core.decide(o.id, true); saveRecent() }.margins(l = dp(8)),
+            if (o.outgoing) View(context).weight1()
+            else column(tv("Saves to", 12f, 400, C.MUTED), tv(shortDir(), 14f, 500, C.INK).margins(t = dp(3))).weight1(),
+            pill(if (o.outgoing) "Cancel" else "Decline", null, Tone.Card) { Core.decide(o.id, false) },
+            pill(if (o.outgoing) "Matches" else "Accept", Ic.Check, Tone.Ink) { Core.decide(o.id, true); saveRecent() }.margins(l = dp(8)),
         ))
     }
 
@@ -669,7 +672,7 @@ class MainActivity : Activity() {
                         }
                         for (o in s.offers.filter { it.id > lastOffer }) {
                             lastOffer = o.id
-                            if (ui == null) notifyOffer(app, nm, o)
+                            if (ui == null && !o.outgoing) notifyOffer(app, nm, o)
                         }
                         ui?.render()
                     }

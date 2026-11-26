@@ -21,6 +21,7 @@ object Core {
     /** [fds] are detached file descriptors; Rust takes ownership and closes them. The first
      *  [images] are clipboard images (PNG): they land on the receiver's clipboard too. */
     external fun send(peer: Long, fds: IntArray, names: Array<String>, texts: Array<String>, images: Int)
+    /** Accepts or declines an offer, or confirms or cancels the sender's own code check. */
     external fun decide(offer: Long, accept: Boolean)
     external fun cancel(job: Long)
     external fun clearFinished()
@@ -28,7 +29,9 @@ object Core {
 
 /** [detail] is the line under the name, from core (`Peer::detail`). */
 class Peer(val id: Long, val name: String, val ip: String, val detail: String)
-class Offer(val id: Long, val summary: String)
+/** A card for this device's user. [code] ("123 456", or empty) is compared with the other screen;
+ *  [outgoing] marks the sender's own code check rather than an incoming offer. */
+class Offer(val id: Long, val summary: String, val code: String, val outgoing: Boolean)
 /** [state] is `w` waiting, `r` running, `d` done, `f` failed. */
 class Job(val id: Long, val label: String, val state: Char, val incoming: Boolean, val fraction: Float, val status: String) {
     val active get() = state == 'w' || state == 'r'
@@ -49,7 +52,7 @@ class Snap(records: Array<String>) {
             val f = r.split('\u001f')
             when (f[0]) {
                 "P" -> peers += Peer(f[1].toLong(), f[2], f[3], f[4])
-                "O" -> offers += Offer(f[1].toLong(), f[2])
+                "O" -> offers += Offer(f[1].toLong(), f[2], f[3], f[4] == "1")
                 "J" -> jobs += Job(f[1].toLong(), f[2], f[3][0], f[4] == "1", f[5].toFloat(), f[6])
                 "T" -> texts += r.substring(2)
                 "I" -> images += r.substring(2)
