@@ -1,6 +1,6 @@
 [package]
 name = "flashhop_core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 # Protocol + engine. Shared by desktop and Android. The one dependency is the Noise protocol

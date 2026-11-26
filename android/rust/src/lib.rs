@@ -109,9 +109,11 @@ pub extern "system" fn Java_app_flashhop_Core_headline(env: JNIEnv, _: JObject, 
 }
 
 /// One record per string, fields separated by U+001F:
-/// `P id name ip detail` | `O id summary` | `J id label state incoming fraction status` | `T text`
-/// | `I path` (a received clipboard image, already saved)
-/// where state is one of `w` (waiting), `r` (running), `d` (done), `f` (failed).
+/// `P id name ip detail` | `O id summary code outgoing` | `J id label state incoming fraction status`
+/// | `T text` | `I path` (a received clipboard image, already saved)
+/// where code is "123 456" or empty (no code to compare) and outgoing is 1 for the sender's own
+/// code check,
+/// and state is one of `w` (waiting), `r` (running), `d` (done), `f` (failed).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_app_flashhop_Core_snapshot(mut env: JNIEnv, _: JObject) -> jobjectArray {
     let mut recs: Vec<String> = vec![];
@@ -121,7 +123,7 @@ pub extern "system" fn Java_app_flashhop_Core_snapshot(mut env: JNIEnv, _: JObje
             recs.push(format!("P{SEP}{}{SEP}{}{SEP}{}{SEP}{}", p.id as i64, clean(&p.name), p.ip, clean(&p.detail())));
         }
         for o in e.offers() {
-            recs.push(format!("O{SEP}{}{SEP}{}", o.id as i64, clean(&o.summary)));
+            recs.push(format!("O{SEP}{}{SEP}{}{SEP}{}{SEP}{}", o.id as i64, clean(&o.summary), o.code.unwrap_or_default(), o.outgoing as u8));
         }
         for j in e.jobs() {
             use flashhop_core::net::State;

@@ -29,7 +29,7 @@ Direct device-to-device over the LAN: no server, no sign-in, no upload limit, en
 ## Capabilities and Constraints
 
 - Items: files, folders, text (≤16 MB, lands in the receiver's clipboard), pasted images (re-encoded to PNG; saved like a file and also put on the receiver's clipboard).
-- States: searching for devices, devices found, staged items, incoming offer (accept/decline), transfer waiting/running (bytes, speed)/done/failed, cancel.
+- States: searching for devices, devices found, staged items, incoming offer (accept/decline), code check (the first time two devices meet or after a key change both show the same 6-digit code: the receiver accepts, the sender taps Matches), transfer waiting/running (bytes, speed)/done/failed, cancel.
 - All user-visible wording for offers and job status comes from `core` (`summarize()`, `Job::status()`, `human()`); UIs must not diverge.
 - Binary size and idle cost are priorities. Desktop embeds one variable UI font (Inter) in place of egui's bundled fonts; no other new dependencies.
 - Android: platform widgets built in code, minSdk 30, targetSdk 36.

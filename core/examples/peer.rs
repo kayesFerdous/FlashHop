@@ -14,7 +14,7 @@ fn main() {
             loop {
                 seen = e.wait(seen, Duration::from_secs(1));
                 for o in e.offers() {
-                    println!("offer: {}  -> accepting", o.summary);
+                    println!("offer: {}  code: {}  -> accepting", o.summary, o.code.as_deref().unwrap_or("-"));
                     e.decide(o.id, true);
                 }
                 for c in e.take_clips() {
@@ -40,7 +40,13 @@ fn main() {
                 })
                 .collect();
             let id = net::Identity::load_or_create(&state().join("identity")).expect("identity");
-            net::send(addr.parse().expect("ip:port"), "test-peer", &id, None, items, &t); // any receiver key
+            // Any receiver key; if it asks for the code check, print the code and confirm.
+            net::send(addr.parse().expect("ip:port"), "test-peer", &id, None, false, items, &t, |code| {
+                println!("code: {code}  -> confirming");
+                let (yes, answer) = std::sync::mpsc::channel();
+                yes.send(true).unwrap();
+                answer
+            });
             println!("{:?}, {} at {}/s", t.state(), human(t.done.load(std::sync::atomic::Ordering::Relaxed)), human(t.speed() as u64));
         }
         _ => eprintln!("usage: peer recv <dir> | peer send <ip:port> <path>|text:<s>|image:<png>..."),
